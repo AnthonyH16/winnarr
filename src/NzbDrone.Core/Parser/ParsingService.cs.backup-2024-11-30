@@ -1,0 +1,1799 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text.RegularExpressions;
+using NLog;
+using NzbDrone.Common.Disk;
+using NzbDrone.Common.Extensions;
+using NzbDrone.Common.Instrumentation.Extensions;
+using NzbDrone.Core.DataAugmentation.Scene;
+using NzbDrone.Core.IndexerSearch.Definitions;
+using NzbDrone.Core.Parser.Model;
+using NzbDrone.Core.Tv;
+
+namespace NzbDrone.Core.Parser
+{
+    public interface IParsingService
+    {
+        Series GetSeries(string title);
+        RemoteEpisode Map(ParsedEpisodeInfo parsedEpisodeInfo, int tvdbId, int tvRageId, string imdbId, SearchCriteriaBase searchCriteria = null);
+        RemoteEpisode Map(ParsedEpisodeInfo parsedEpisodeInfo, Series series);
+        RemoteEpisode Map(ParsedEpisodeInfo parsedEpisodeInfo, int seriesId, IEnumerable<int> episodeIds);
+        List<Episode> GetEpisodes(ParsedEpisodeInfo parsedEpisodeInfo, Series series, bool sceneSource, SearchCriteriaBase searchCriteria = null);
+        ParsedEpisodeInfo ParseSpecialEpisodeTitle(ParsedEpisodeInfo parsedEpisodeInfo, string releaseTitle, int tvdbId, int tvRageId, string imdbId, SearchCriteriaBase searchCriteria = null);
+        ParsedEpisodeInfo ParseSpecialEpisodeTitle(ParsedEpisodeInfo parsedEpisodeInfo, string releaseTitle, Series series);
+    }
+
+    public class ParsingService : IParsingService
+    {
+        private readonly IEpisodeService _episodeService;
+        private readonly ISeriesService _seriesService;
+        private readonly ISceneMappingService _sceneMappingService;
+        private readonly IDiskProvider _diskProvider;
+        private readonly Logger _logger;
+
+        // Constants for file date disambiguation
+        private const int ConfidentMatchDaysDifference = 14; // Days difference to confidently choose one episode
+        private const int SuggestMatchDaysWindow = 7;        // Days from air date to suggest match
+
+        public ParsingService(IEpisodeService episodeService,
+                              ISeriesService seriesService,
+                              ISceneMappingService sceneMappingService,
+                              IDiskProvider diskProvider,
+                              Logger logger)
+        {
+            _episodeService = episodeService;
+            _seriesService = seriesService;
+            _sceneMappingService = sceneMappingService;
+            _diskProvider = diskProvider;
+            _logger = logger;
+        }
+
+        public Series GetSeries(string title)
+        {
+            var parsedEpisodeInfo = Parser.ParseTitle(title);
+
+            if (parsedEpisodeInfo == null)
+            {
+                return _seriesService.FindByTitle(title);
+            }
+
+            var tvdbId = _sceneMappingService.FindTvdbId(parsedEpisodeInfo.SeriesTitle, parsedEpisodeInfo.ReleaseTitle, parsedEpisodeInfo.SeasonNumber);
+
+            if (tvdbId.HasValue)
+            {
+                return _seriesService.FindByTvdbId(tvdbId.Value);
+            }
+
+            var series = _seriesService.FindByTitle(parsedEpisodeInfo.SeriesTitle);
+
+            if (series == null && parsedEpisodeInfo.SeriesTitleInfo.AllTitles != null)
+            {
+                series = GetSeriesByAllTitles(parsedEpisodeInfo);
+            }
+
+            if (series == null)
+            {
+                series = _seriesService.FindByTitle(parsedEpisodeInfo.SeriesTitleInfo.TitleWithoutYear,
+                                                    parsedEpisodeInfo.SeriesTitleInfo.Year);
+            }
+
+            return series;
+        }
+
+        private Series GetSeriesByAllTitles(ParsedEpisodeInfo parsedEpisodeInfo)
+        {
+            Series foundSeries = null;
+            int? foundTvdbId = null;
+
+            // Match each title individually, they must all resolve to the same tvdbid
+            foreach (var title in parsedEpisodeInfo.SeriesTitleInfo.AllTitles)
+            {
+                var series = _seriesService.FindByTitle(title);
+                var tvdbId = series?.TvdbId;
+
+                if (series == null)
+                {
+                    tvdbId = _sceneMappingService.FindTvdbId(title, parsedEpisodeInfo.ReleaseTitle, parsedEpisodeInfo.SeasonNumber);
+                }
+
+                if (!tvdbId.HasValue)
+                {
+                    _logger.Trace("Title {0} not matching any series.", title);
+                    continue;
+                }
+
+                if (foundTvdbId.HasValue && tvdbId != foundTvdbId)
+                {
+                    _logger.Trace("Title {0} both matches tvdbid {1} and {2}, no series selected.", parsedEpisodeInfo.SeriesTitle, foundTvdbId, tvdbId);
+                    return null;
+                }
+
+                if (foundSeries == null)
+                {
+                    foundSeries = series;
+                }
+
+                foundTvdbId = tvdbId;
+            }
+
+            if (foundSeries == null && foundTvdbId.HasValue)
+            {
+                foundSeries = _seriesService.FindByTvdbId(foundTvdbId.Value);
+            }
+
+            return foundSeries;
+        }
+
+        public RemoteEpisode Map(ParsedEpisodeInfo parsedEpisodeInfo, int tvdbId, int tvRageId, string imdbId, SearchCriteriaBase searchCriteria = null)
+        {
+            return Map(parsedEpisodeInfo, tvdbId, tvRageId, imdbId, null, searchCriteria);
+        }
+
+        public RemoteEpisode Map(ParsedEpisodeInfo parsedEpisodeInfo, Series series)
+        {
+            return Map(parsedEpisodeInfo, 0, 0, null, series, null);
+        }
+
+        public RemoteEpisode Map(ParsedEpisodeInfo parsedEpisodeInfo, int seriesId, IEnumerable<int> episodeIds)
+        {
+            return new RemoteEpisode
+                   {
+                       ParsedEpisodeInfo = parsedEpisodeInfo,
+                       Series = _seriesService.GetSeries(seriesId),
+                       Episodes = _episodeService.GetEpisodes(episodeIds)
+                   };
+        }
+
+        private RemoteEpisode Map(ParsedEpisodeInfo parsedEpisodeInfo, int tvdbId, int tvRageId, string imdbId, Series series, SearchCriteriaBase searchCriteria)
+        {
+            var sceneMapping = _sceneMappingService.FindSceneMapping(parsedEpisodeInfo.SeriesTitle, parsedEpisodeInfo.ReleaseTitle, parsedEpisodeInfo.SeasonNumber);
+
+            var remoteEpisode = new RemoteEpisode
+            {
+                ParsedEpisodeInfo = parsedEpisodeInfo,
+                SceneMapping = sceneMapping,
+                MappedSeasonNumber = parsedEpisodeInfo.SeasonNumber
+            };
+
+            // For now we just detect tvdb vs scene, but we can do multiple 'origins' in the future.
+            var sceneSource = true;
+            if (sceneMapping != null)
+            {
+                if (sceneMapping.SeasonNumber.HasValue && sceneMapping.SeasonNumber.Value >= 0 &&
+                    sceneMapping.SceneSeasonNumber <= parsedEpisodeInfo.SeasonNumber)
+                {
+                    remoteEpisode.MappedSeasonNumber += sceneMapping.SeasonNumber.Value - sceneMapping.SceneSeasonNumber.Value;
+                }
+
+                if (sceneMapping.SceneOrigin == "tvdb")
+                {
+                    sceneSource = false;
+                }
+                else if (sceneMapping.Type == "XemService" &&
+                         sceneMapping.SceneSeasonNumber.NonNegative().HasValue &&
+                         parsedEpisodeInfo.SeasonNumber == 1 &&
+                         sceneMapping.SceneSeasonNumber != parsedEpisodeInfo.SeasonNumber)
+                {
+                    remoteEpisode.MappedSeasonNumber = sceneMapping.SceneSeasonNumber.Value;
+                }
+            }
+
+            if (series == null)
+            {
+                var seriesMatch = FindSeries(parsedEpisodeInfo, tvdbId, tvRageId, imdbId, sceneMapping, searchCriteria);
+
+                if (seriesMatch != null)
+                {
+                    series = seriesMatch.Series;
+                    remoteEpisode.SeriesMatchType = seriesMatch.MatchType;
+                }
+            }
+
+            if (series != null)
+            {
+                remoteEpisode.Series = series;
+
+                if (ValidateParsedEpisodeInfo.ValidateForSeriesType(parsedEpisodeInfo, series))
+                {
+                    remoteEpisode.Episodes = GetEpisodes(parsedEpisodeInfo, series, remoteEpisode.MappedSeasonNumber, sceneSource, searchCriteria);
+                }
+            }
+
+            remoteEpisode.Languages = parsedEpisodeInfo.Languages;
+
+            if (remoteEpisode.Episodes == null)
+            {
+                remoteEpisode.Episodes = new List<Episode>();
+            }
+
+            if (searchCriteria != null)
+            {
+                var requestedEpisodes = searchCriteria.Episodes.ToDictionaryIgnoreDuplicates(v => v.Id);
+                remoteEpisode.EpisodeRequested = remoteEpisode.Episodes.Any(v => requestedEpisodes.ContainsKey(v.Id));
+            }
+
+            return remoteEpisode;
+        }
+
+        public List<Episode> GetEpisodes(ParsedEpisodeInfo parsedEpisodeInfo, Series series, bool sceneSource, SearchCriteriaBase searchCriteria = null)
+        {
+            if (sceneSource)
+            {
+                var remoteEpisode = Map(parsedEpisodeInfo, 0, 0, null, series, searchCriteria);
+
+                return remoteEpisode.Episodes;
+            }
+
+            return GetEpisodes(parsedEpisodeInfo, series, parsedEpisodeInfo.SeasonNumber, sceneSource, searchCriteria);
+        }
+
+        private List<Episode> GetEpisodes(ParsedEpisodeInfo parsedEpisodeInfo, Series series, int mappedSeasonNumber, bool sceneSource, SearchCriteriaBase searchCriteria)
+        {
+            _logger.Info("GETEP-START: Called for series '{0}', season {1}, IsRacingContent={2}, sceneSource={3}",
+                series.Title, mappedSeasonNumber, parsedEpisodeInfo.IsRacingContent, sceneSource);
+
+            if (parsedEpisodeInfo.FullSeason)
+            {
+                if (series.UseSceneNumbering && sceneSource)
+                {
+                    var episodes = _episodeService.GetEpisodesBySceneSeason(series.Id, mappedSeasonNumber);
+
+                    // If episodes were found by the scene season number return them, otherwise fallback to look-up by season number
+                    if (episodes.Any())
+                    {
+                        return episodes;
+                    }
+                }
+
+                return _episodeService.GetEpisodesBySeason(series.Id, mappedSeasonNumber);
+            }
+
+            // Handle racing content (Formula 1, MotoGP, WSBK)
+            if (parsedEpisodeInfo.IsRacingContent)
+            {
+                _logger.Info("GETEP: IsRacingContent=true, calling FindRacingEpisode for series '{0}', season {1}, GP '{2}', session '{3}'",
+                    series.Title, mappedSeasonNumber, parsedEpisodeInfo.RacingGpName, parsedEpisodeInfo.RacingSessionType);
+
+                var racingEpisode = FindRacingEpisode(series, mappedSeasonNumber, parsedEpisodeInfo.RacingGpName, parsedEpisodeInfo.RacingSessionType, parsedEpisodeInfo.RacingClass);
+
+                if (racingEpisode != null)
+                {
+                    return new List<Episode> { racingEpisode };
+                }
+
+                _logger.Warn("GETEP: Unable to find racing episode for GP: {0}, Session: {1}", parsedEpisodeInfo.RacingGpName, parsedEpisodeInfo.RacingSessionType);
+                return new List<Episode>();
+            }
+
+            if (parsedEpisodeInfo.IsDaily)
+            {
+                var episodeInfo = GetDailyEpisode(series, parsedEpisodeInfo.AirDate, parsedEpisodeInfo.DailyPart, searchCriteria);
+
+                if (episodeInfo != null)
+                {
+                    return new List<Episode> { episodeInfo };
+                }
+
+                return new List<Episode>();
+            }
+
+            if (parsedEpisodeInfo.IsAbsoluteNumbering)
+            {
+                return GetAnimeEpisodes(series, parsedEpisodeInfo, mappedSeasonNumber, sceneSource, searchCriteria);
+            }
+
+            if (parsedEpisodeInfo.IsPossibleSceneSeasonSpecial)
+            {
+                var parsedSpecialEpisodeInfo = ParseSpecialEpisodeTitle(parsedEpisodeInfo, parsedEpisodeInfo.ReleaseTitle, series);
+
+                if (parsedSpecialEpisodeInfo != null)
+                {
+                    // Use the season number and disable scene source since the season/episode numbers that were returned are not scene numbers
+                    return GetStandardEpisodes(series, parsedSpecialEpisodeInfo, parsedSpecialEpisodeInfo.SeasonNumber, false, searchCriteria);
+                }
+            }
+
+            if (parsedEpisodeInfo.Special && mappedSeasonNumber != 0)
+            {
+                return new List<Episode>();
+            }
+
+            return GetStandardEpisodes(series, parsedEpisodeInfo, mappedSeasonNumber, sceneSource, searchCriteria);
+        }
+
+        public ParsedEpisodeInfo ParseSpecialEpisodeTitle(ParsedEpisodeInfo parsedEpisodeInfo, string releaseTitle, int tvdbId, int tvRageId, string imdbId, SearchCriteriaBase searchCriteria = null)
+        {
+            if (searchCriteria != null)
+            {
+                if (tvdbId != 0 && tvdbId == searchCriteria.Series.TvdbId)
+                {
+                    return ParseSpecialEpisodeTitle(parsedEpisodeInfo, releaseTitle, searchCriteria.Series);
+                }
+
+                if (tvRageId != 0 && tvRageId == searchCriteria.Series.TvRageId)
+                {
+                    return ParseSpecialEpisodeTitle(parsedEpisodeInfo, releaseTitle, searchCriteria.Series);
+                }
+
+                if (imdbId.IsNotNullOrWhiteSpace() && imdbId.Equals(searchCriteria.Series.ImdbId, StringComparison.Ordinal))
+                {
+                    return ParseSpecialEpisodeTitle(parsedEpisodeInfo, releaseTitle, searchCriteria.Series);
+                }
+            }
+
+            var series = GetSeries(releaseTitle);
+
+            if (series == null)
+            {
+                series = _seriesService.FindByTitleInexact(releaseTitle);
+            }
+
+            if (series == null && tvdbId > 0)
+            {
+                series = _seriesService.FindByTvdbId(tvdbId);
+            }
+
+            if (series == null && tvRageId > 0)
+            {
+                series = _seriesService.FindByTvRageId(tvRageId);
+            }
+
+            if (series == null && imdbId.IsNotNullOrWhiteSpace())
+            {
+                series = _seriesService.FindByImdbId(imdbId);
+            }
+
+            if (series == null)
+            {
+                _logger.Debug("No matching series {0}", releaseTitle);
+                return null;
+            }
+
+            return ParseSpecialEpisodeTitle(parsedEpisodeInfo, releaseTitle, series);
+        }
+
+        public ParsedEpisodeInfo ParseSpecialEpisodeTitle(ParsedEpisodeInfo parsedEpisodeInfo, string releaseTitle, Series series)
+        {
+            // SxxE00 episodes are sometimes mapped via TheXEM, don't use episode title parsing in that case.
+            if (parsedEpisodeInfo != null && parsedEpisodeInfo.IsPossibleSceneSeasonSpecial && series.UseSceneNumbering)
+            {
+                if (_episodeService.FindEpisodesBySceneNumbering(series.Id, parsedEpisodeInfo.SeasonNumber, 0).Any())
+                {
+                    return parsedEpisodeInfo;
+                }
+            }
+
+            // find special episode in series season 0
+            var episode = _episodeService.FindEpisodeByTitle(series.Id, 0, releaseTitle);
+
+            if (episode != null)
+            {
+                // create parsed info from tv episode
+                var info = new ParsedEpisodeInfo
+                {
+                    ReleaseTitle = releaseTitle,
+                    SeriesTitle = series.Title,
+                    SeriesTitleInfo = new SeriesTitleInfo
+                        {
+                            Title = series.Title
+                        },
+                    SeasonNumber = episode.SeasonNumber,
+                    EpisodeNumbers = new int[1] { episode.EpisodeNumber },
+                    FullSeason = false,
+                    Quality = QualityParser.ParseQuality(releaseTitle),
+                    ReleaseGroup = ReleaseGroupParser.ParseReleaseGroup(releaseTitle),
+                    Languages = LanguageParser.ParseLanguages(releaseTitle),
+                    Special = true
+                };
+
+                _logger.Debug("Found special episode {0} for title '{1}'", info, releaseTitle);
+                return info;
+            }
+
+            return null;
+        }
+
+        private FindSeriesResult FindSeries(ParsedEpisodeInfo parsedEpisodeInfo, int tvdbId, int tvRageId, string imdbId, SceneMapping sceneMapping, SearchCriteriaBase searchCriteria)
+        {
+            Series series = null;
+
+            if (sceneMapping != null)
+            {
+                if (searchCriteria != null && searchCriteria.Series.TvdbId == sceneMapping.TvdbId)
+                {
+                    return new FindSeriesResult(searchCriteria.Series, SeriesMatchType.Alias);
+                }
+
+                series = _seriesService.FindByTvdbId(sceneMapping.TvdbId);
+
+                if (series == null)
+                {
+                    _logger.Debug("No matching series {0}", parsedEpisodeInfo.SeriesTitle);
+                    return null;
+                }
+
+                return new FindSeriesResult(series, SeriesMatchType.Alias);
+            }
+
+            if (searchCriteria != null)
+            {
+                if (searchCriteria.Series.CleanTitle == parsedEpisodeInfo.SeriesTitle.CleanSeriesTitle())
+                {
+                    return new FindSeriesResult(searchCriteria.Series, SeriesMatchType.Title);
+                }
+
+                if (tvdbId > 0 && tvdbId == searchCriteria.Series.TvdbId)
+                {
+                    _logger.ForDebugEvent()
+                           .Message("Found matching series by TVDB ID {0}, an alias may be needed for: {1}", tvdbId, parsedEpisodeInfo.SeriesTitle)
+                           .Property("TvdbId", tvdbId)
+                           .Property("ParsedEpisodeInfo", parsedEpisodeInfo)
+                           .WriteSentryWarn("TvdbIdMatch", tvdbId.ToString(), parsedEpisodeInfo.SeriesTitle)
+                           .Log();
+
+                    return new FindSeriesResult(searchCriteria.Series, SeriesMatchType.Id);
+                }
+
+                if (tvRageId > 0 && tvRageId == searchCriteria.Series.TvRageId && tvdbId <= 0)
+                {
+                    _logger.ForDebugEvent()
+                           .Message("Found matching series by TVRage ID {0}, an alias may be needed for: {1}", tvRageId, parsedEpisodeInfo.SeriesTitle)
+                           .Property("TvRageId", tvRageId)
+                           .Property("ParsedEpisodeInfo", parsedEpisodeInfo)
+                           .WriteSentryWarn("TvRageIdMatch", tvRageId.ToString(), parsedEpisodeInfo.SeriesTitle)
+                           .Log();
+
+                    return new FindSeriesResult(searchCriteria.Series, SeriesMatchType.Id);
+                }
+
+                if (imdbId.IsNotNullOrWhiteSpace() && imdbId.Equals(searchCriteria.Series.ImdbId, StringComparison.Ordinal) && tvdbId <= 0)
+                {
+                    _logger.ForDebugEvent()
+                           .Message("Found matching series by IMDb ID {0}, an alias may be needed for: {1}", imdbId, parsedEpisodeInfo.SeriesTitle)
+                           .Property("ImdbId", imdbId)
+                           .Property("ParsedEpisodeInfo", parsedEpisodeInfo)
+                           .WriteSentryWarn("ImdbIdMatch", imdbId, parsedEpisodeInfo.SeriesTitle)
+                           .Log();
+
+                    return new FindSeriesResult(searchCriteria.Series, SeriesMatchType.Id);
+                }
+            }
+
+            var matchType = SeriesMatchType.Unknown;
+            series = _seriesService.FindByTitle(parsedEpisodeInfo.SeriesTitle);
+
+            if (series != null)
+            {
+                matchType = SeriesMatchType.Title;
+            }
+
+            if (series == null && parsedEpisodeInfo.SeriesTitleInfo.AllTitles != null)
+            {
+                series = GetSeriesByAllTitles(parsedEpisodeInfo);
+                matchType = SeriesMatchType.Title;
+            }
+
+            if (series == null && parsedEpisodeInfo.SeriesTitleInfo.Year > 0)
+            {
+                series = _seriesService.FindByTitle(parsedEpisodeInfo.SeriesTitleInfo.TitleWithoutYear, parsedEpisodeInfo.SeriesTitleInfo.Year);
+                matchType = SeriesMatchType.Title;
+            }
+
+            if (series == null && tvdbId > 0)
+            {
+                series = _seriesService.FindByTvdbId(tvdbId);
+
+                if (series != null)
+                {
+                    _logger.ForDebugEvent()
+                           .Message("Found matching series by TVDB ID {0}, an alias may be needed for: {1}", tvdbId, parsedEpisodeInfo.SeriesTitle)
+                           .Property("TvdbId", tvdbId)
+                           .Property("ParsedEpisodeInfo", parsedEpisodeInfo)
+                           .WriteSentryWarn("TvdbIdMatch", tvdbId.ToString(), parsedEpisodeInfo.SeriesTitle)
+                           .Log();
+
+                    matchType = SeriesMatchType.Id;
+                }
+            }
+
+            if (series == null && tvRageId > 0 && tvdbId <= 0)
+            {
+                series = _seriesService.FindByTvRageId(tvRageId);
+
+                if (series != null)
+                {
+                    _logger.ForDebugEvent()
+                           .Message("Found matching series by TVRage ID {0}, an alias may be needed for: {1}", tvRageId, parsedEpisodeInfo.SeriesTitle)
+                           .Property("TvRageId", tvRageId)
+                           .Property("ParsedEpisodeInfo", parsedEpisodeInfo)
+                           .WriteSentryWarn("TvRageIdMatch", tvRageId.ToString(), parsedEpisodeInfo.SeriesTitle)
+                           .Log();
+
+                    matchType = SeriesMatchType.Id;
+                }
+            }
+
+            if (series == null && imdbId.IsNotNullOrWhiteSpace() && tvdbId <= 0)
+            {
+                series = _seriesService.FindByImdbId(imdbId);
+
+                if (series != null)
+                {
+                    _logger.ForDebugEvent()
+                           .Message("Found matching series by IMDb ID {0}, an alias may be needed for: {1}", imdbId, parsedEpisodeInfo.SeriesTitle)
+                           .Property("ImdbId", imdbId)
+                           .Property("ParsedEpisodeInfo", parsedEpisodeInfo)
+                           .WriteSentryWarn("ImdbIdMatch", imdbId, parsedEpisodeInfo.SeriesTitle)
+                           .Log();
+
+                    matchType = SeriesMatchType.Id;
+                }
+            }
+
+            if (series == null)
+            {
+                _logger.Debug("No matching series {0}", parsedEpisodeInfo.SeriesTitle);
+                return null;
+            }
+
+            return new FindSeriesResult(series, matchType);
+        }
+
+        private Episode GetDailyEpisode(Series series, string airDate, int? part, SearchCriteriaBase searchCriteria)
+        {
+            Episode episodeInfo = null;
+
+            if (searchCriteria != null)
+            {
+                episodeInfo = searchCriteria.Episodes.SingleOrDefault(
+                    e => e.AirDate == airDate);
+            }
+
+            if (episodeInfo == null)
+            {
+                episodeInfo = _episodeService.FindEpisode(series.Id, airDate, part);
+            }
+
+            return episodeInfo;
+        }
+
+        private List<Episode> GetAnimeEpisodes(Series series, ParsedEpisodeInfo parsedEpisodeInfo, int seasonNumber, bool sceneSource, SearchCriteriaBase searchCriteria)
+        {
+            var result = new List<Episode>();
+
+            var sceneSeasonNumber = _sceneMappingService.GetSceneSeasonNumber(parsedEpisodeInfo.SeriesTitle, parsedEpisodeInfo.ReleaseTitle);
+
+            foreach (var absoluteEpisodeNumber in parsedEpisodeInfo.AbsoluteEpisodeNumbers)
+            {
+                var episodes = new List<Episode>();
+
+                if (parsedEpisodeInfo.Special)
+                {
+                    var episode = _episodeService.FindEpisode(series.Id, 0, absoluteEpisodeNumber);
+                    episodes.AddIfNotNull(episode);
+                }
+                else if (sceneSource)
+                {
+                    // Is there a reason why we excluded season 1 from this handling before?
+                    // Might have something to do with the scene name to season number check
+                    // If this needs to be reverted tests will need to be added
+                    if (sceneSeasonNumber.HasValue)
+                    {
+                        episodes = _episodeService.FindEpisodesBySceneNumbering(series.Id, sceneSeasonNumber.Value, absoluteEpisodeNumber);
+
+                        if (episodes.Empty())
+                        {
+                            var episode = _episodeService.FindEpisode(series.Id, sceneSeasonNumber.Value, absoluteEpisodeNumber);
+                            episodes.AddIfNotNull(episode);
+                        }
+                    }
+                    else if (parsedEpisodeInfo.SeasonNumber > 1 && parsedEpisodeInfo.EpisodeNumbers.Empty())
+                    {
+                        episodes = _episodeService.FindEpisodesBySceneNumbering(series.Id, parsedEpisodeInfo.SeasonNumber, absoluteEpisodeNumber);
+
+                        if (episodes.Empty())
+                        {
+                            var episode = _episodeService.FindEpisode(series.Id, parsedEpisodeInfo.SeasonNumber, absoluteEpisodeNumber);
+                            episodes.AddIfNotNull(episode);
+                        }
+                    }
+                    else
+                    {
+                        episodes = _episodeService.FindEpisodesBySceneNumbering(series.Id, absoluteEpisodeNumber);
+
+                        // Don't allow multiple results without a scene name mapping.
+                        if (episodes.Count > 1)
+                        {
+                            episodes.Clear();
+                        }
+                    }
+                }
+
+                if (episodes.Empty())
+                {
+                    var episode = _episodeService.FindEpisode(series.Id, absoluteEpisodeNumber);
+                    episodes.AddIfNotNull(episode);
+                }
+
+                foreach (var episode in episodes)
+                {
+                    _logger.Debug("Using absolute episode number {0} for: {1} - TVDB: {2}x{3:00}",
+                                absoluteEpisodeNumber,
+                                series.Title,
+                                episode.SeasonNumber,
+                                episode.EpisodeNumber);
+
+                    result.Add(episode);
+                }
+            }
+
+            return result;
+        }
+
+        private List<Episode> GetStandardEpisodes(Series series, ParsedEpisodeInfo parsedEpisodeInfo, int mappedSeasonNumber, bool sceneSource, SearchCriteriaBase searchCriteria)
+        {
+            var result = new List<Episode>();
+
+            if (parsedEpisodeInfo.EpisodeNumbers == null)
+            {
+                return new List<Episode>();
+            }
+
+            foreach (var episodeNumber in parsedEpisodeInfo.EpisodeNumbers)
+            {
+                if (series.UseSceneNumbering && sceneSource)
+                {
+                    var episodes = new List<Episode>();
+
+                    if (searchCriteria != null)
+                    {
+                        episodes = searchCriteria.Episodes.Where(e => e.SceneSeasonNumber == parsedEpisodeInfo.SeasonNumber &&
+                                                                      e.SceneEpisodeNumber == episodeNumber).ToList();
+                    }
+
+                    if (!episodes.Any())
+                    {
+                        episodes = _episodeService.FindEpisodesBySceneNumbering(series.Id, mappedSeasonNumber, episodeNumber);
+                    }
+
+                    if (episodes != null && episodes.Any())
+                    {
+                        _logger.Debug("Using Scene to TVDB Mapping for: {0} - Scene: {1}x{2:00} - TVDB: {3}",
+                                    series.Title,
+                                    episodes.First().SceneSeasonNumber,
+                                    episodes.First().SceneEpisodeNumber,
+                                    string.Join(", ", episodes.Select(e => string.Format("{0}x{1:00}", e.SeasonNumber, e.EpisodeNumber))));
+
+                        result.AddRange(episodes);
+                        continue;
+                    }
+                }
+
+                Episode episodeInfo = null;
+
+                if (searchCriteria != null)
+                {
+                    episodeInfo = searchCriteria.Episodes.SingleOrDefault(e => e.SeasonNumber == mappedSeasonNumber && e.EpisodeNumber == episodeNumber);
+                }
+
+                if (episodeInfo == null)
+                {
+                    episodeInfo = _episodeService.FindEpisode(series.Id, mappedSeasonNumber, episodeNumber);
+                }
+
+                if (episodeInfo != null)
+                {
+                    result.Add(episodeInfo);
+                }
+                else
+                {
+                    _logger.Debug("Unable to find {0}", parsedEpisodeInfo);
+                }
+            }
+
+            return result;
+        }
+
+        // GP name mappings: key = normalized name from filename, values = variations to search in TVDB titles
+        // For countries with multiple circuits, use circuit-specific entries to prevent wrong matches
+        private static readonly Dictionary<string, string[]> GpNameVariations = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase)
+        {
+            { "argentina", new[] { "arg", "argentina", "termas" } },
+            { "australia", new[] { "aus", "australia", "australian", "phillip island" } },
+            { "austria", new[] { "aut", "austria", "austrian", "österreich", "osterreich", "red bull ring", "spielberg" } },
+            { "österreich", new[] { "österreich", "osterreich", "austria", "austrian", "red bull ring", "spielberg" } },
+            { "osterreich", new[] { "osterreich", "österreich", "austria", "austrian", "red bull ring", "spielberg" } },
+            { "spielberg", new[] { "spielberg", "aut", "austria", "austrian", "österreich", "osterreich", "red bull ring" } },
+            { "styria", new[] { "styria", "styrian", "steiermark" } },
+            { "styrian", new[] { "styrian", "styria", "steiermark" } },
+            { "steiermark", new[] { "steiermark", "styria", "styrian" } },
+            { "azerbaijan", new[] { "aze", "azerbaijan", "baku" } },
+            { "bahrain", new[] { "bhr", "bahrain", "sakhir" } },
+            { "belgium", new[] { "bel", "belgium", "belgian", "spa" } },
+            { "brazil", new[] { "bra", "brazil", "brazilian", "interlagos", "sao paulo", "são paulo" } },
+            { "britain", new[] { "gbr", "britain", "british", "silverstone", "united kingdom", "uk" } },
+            { "united kingdom", new[] { "gbr", "britain", "british", "silverstone", "uk" } },
+            { "canada", new[] { "can", "canada", "canadian", "montreal" } },
+            { "china", new[] { "chn", "china", "chinese", "shanghai" } },
+            { "czech", new[] { "cze", "czech", "brno" } },
+            { "czech republic", new[] { "cze", "czech", "brno" } },
+            { "france", new[] { "fra", "france", "le mans", "paul ricard" } },
+            { "hungary", new[] { "hun", "hungary", "hungarian", "hungaroring", "budapest" } },
+            { "india", new[] { "ind", "india", "buddh" } },
+            { "indonesia", new[] { "ina", "indonesia", "mandalika", "lombok" } },
+            { "kazakhstan", new[] { "kaz", "kazakhstan" } },
+            { "malaysia", new[] { "mal", "malaysia", "sepang" } },
+            { "mexico", new[] { "mex", "mexico", "mexican" } },
+            { "monaco", new[] { "mon", "monaco", "monte carlo" } },
+            { "netherlands", new[] { "ned", "netherlands", "assen", "dutch" } },
+            { "qatar", new[] { "qat", "qatar", "losail", "lusail" } },
+            { "russia", new[] { "rus", "russia", "russian", "sochi" } },
+            { "russian", new[] { "russian", "russia", "rus", "sochi" } },
+            { "singapore", new[] { "sgp", "singapore", "marina bay" } },
+            { "thailand", new[] { "tha", "thailand", "buriram", "chang" } },
+            { "turkey", new[] { "tur", "turkey", "turkish", "istanbul" } },
+            { "turkish", new[] { "turkish", "turkey", "tur", "istanbul" } },
+            { "vietnam", new[] { "vie", "vietnam", "hanoi" } },
+
+            // USA circuits - split by specific circuit to prevent COTA matching to Miami
+            { "cota", new[] { "cota", "austin", "united states", "usa", "americas" } },
+            { "austin", new[] { "austin", "cota", "united states", "usa", "americas" } },
+            { "miami", new[] { "miami" } },
+            { "las vegas", new[] { "las vegas", "vegas" } },
+            { "vegas", new[] { "vegas", "las vegas" } },
+            { "indianapolis", new[] { "indianapolis", "indy" } },
+            { "usa", new[] { "united states", "usa", "americas" } }, // Generic USA (no specific circuit)
+            { "united states", new[] { "united states", "usa", "americas" } },
+            { "americas", new[] { "americas", "united states", "usa" } },
+
+            // Italy circuits - split by specific circuit
+            { "monza", new[] { "monza", "italia", "italian", "italy" } },
+            { "mugello", new[] { "mugello", "toscana", "tuscany" } },
+            { "misano", new[] { "misano" } }, // Note: shared between Italy and San Marino GPs
+            { "imola", new[] { "imola", "emilia", "emilia romagna" } },
+            { "emilia", new[] { "emilia", "imola", "emilia romagna" } },
+            { "emilia romagna", new[] { "emilia romagna", "emilia", "imola" } },
+            { "toscana", new[] { "toscana", "tuscany", "mugello" } },
+            { "tuscany", new[] { "tuscany", "toscana", "mugello" } },
+            { "italy", new[] { "italy", "ita", "italia", "italian" } }, // Generic Italy (no specific circuit)
+
+            // Spain circuits - split by specific circuit
+            { "catalunya", new[] { "catalunya", "catalonia", "barcelona", "spain" } },
+            { "catalonia", new[] { "catalonia", "catalunya", "barcelona", "spain" } },
+            { "barcelona", new[] { "barcelona", "catalunya", "catalonia", "spain" } },
+            { "jerez", new[] { "jerez", "spain" } },
+            { "valencia", new[] { "valencia", "ricardo tormo", "spain" } },
+            { "aragon", new[] { "aragon", "spain" } },
+            { "spain", new[] { "spain", "españa", "espana", "esp" } }, // Generic Spain (no specific circuit)
+
+            // Japan circuits - split by specific circuit
+            { "suzuka", new[] { "suzuka", "japan" } },
+            { "motegi", new[] { "motegi", "japan" } },
+            { "japan", new[] { "japan", "japanese", "jpn" } }, // Generic Japan (no specific circuit)
+
+            // Germany circuits - split by specific circuit
+            { "hockenheim", new[] { "hockenheim", "germany" } },
+            { "nurburgring", new[] { "nurburgring", "eifel", "germany" } },
+            { "sachsenring", new[] { "sachsenring", "germany" } },
+            { "eifel", new[] { "eifel", "nurburgring", "germany" } },
+            { "germany", new[] { "germany", "ger", "deutschland", "eifel" } }, // Generic Germany (no specific circuit)
+            { "deutschland", new[] { "deutschland", "germany", "ger" } },
+
+            // Portugal circuits - split by specific circuit
+            { "portimao", new[] { "portimao", "algarve", "portugal" } },
+            { "algarve", new[] { "algarve", "portimao", "portugal" } },
+            { "estoril", new[] { "estoril", "portugal" } },
+            { "portugal", new[] { "portugal", "portuguese", "por" } }, // Generic Portugal (no specific circuit)
+
+            // Europe GP (held at various circuits, historically Valencia)
+            { "europa", new[] { "europa", "europe", "european", "valencia" } },
+            { "europe", new[] { "europe", "europa", "european", "valencia" } },
+            { "european", new[] { "european", "europe", "europa", "valencia" } },
+
+            // San Marino uses Misano circuit
+            { "san marino", new[] { "san marino", "misano", "rimini" } },
+
+            // Saudi Arabia
+            { "saudi", new[] { "saudi", "saudi arabia", "jeddah" } },
+            { "saudi arabia", new[] { "saudi arabia", "saudi", "jeddah" } },
+            { "jeddah", new[] { "jeddah", "saudi", "saudi arabia" } },
+            { "arabia", new[] { "saudi arabia", "saudi", "jeddah" } },
+            { "saudita", new[] { "saudi arabia", "saudi", "jeddah" } }, // Spanish naming
+
+            // Common nationality adjectives
+            { "hungarian", new[] { "hun", "hungary", "hungaroring" } },
+            { "spanish", new[] { "esp", "spain", "españa", "espana" } },
+            { "british", new[] { "gbr", "britain", "silverstone" } },
+            { "american", new[] { "americas", "united states", "usa" } },
+            { "german", new[] { "ger", "germany" } },
+            { "italian", new[] { "ita", "italy" } },
+            { "french", new[] { "fra", "france" } },
+            { "japanese", new[] { "jpn", "japan" } },
+            { "dutch", new[] { "ned", "netherlands", "assen" } },
+            { "portuguese", new[] { "por", "portugal" } },
+            { "mexican", new[] { "mex", "mexico" } },
+            { "canadian", new[] { "can", "canada", "canadian", "montreal" } },
+            { "chinese", new[] { "chn", "china", "chinese", "shanghai" } },
+            { "belgian", new[] { "bel", "belgium", "belgian", "spa" } },
+            { "australian", new[] { "aus", "australia", "australian", "phillip island" } },
+            { "austrian", new[] { "aut", "austria", "austrian", "österreich", "osterreich", "red bull ring", "spielberg" } },
+            { "brazilian", new[] { "bra", "brazil", "brazilian", "interlagos", "sao paulo", "são paulo" } },
+        };
+
+        /// <summary>
+        /// Known double-header circuits where the same circuit hosted multiple GPs in the same season.
+        /// Maps circuit name to the specific GP names that can disambiguate.
+        /// </summary>
+        private static readonly Dictionary<string, string[]> DoubleHeaderDisambiguators = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase)
+        {
+            // 2020 COVID double-headers
+            { "jerez", new[] { "andalucia", "andalusia" } },           // Spain vs Andalucia GP
+            { "red bull ring", new[] { "styria", "styrian", "steiermark" } }, // Austria vs Styria GP
+            { "spielberg", new[] { "styria", "styrian", "steiermark" } },
+            { "misano", new[] { "emilia", "romagna" } },               // San Marino vs Emilia Romagna GP
+            { "aragon", new[] { "teruel" } },                          // Aragon vs Teruel GP
+            { "valencia", new[] { "europe", "europa", "european" } },  // Valencia vs Europe GP
+            { "silverstone", new[] { "70th", "anniversary" } },        // Britain vs 70th Anniversary GP
+            { "mugello", new[] { "toscana", "tuscany", "tuscan" } },   // Italy vs Toscana GP
+            { "bahrain", new[] { "sakhir" } },                         // Bahrain vs Sakhir GP
+            // 2021 double-headers
+            { "losail", new[] { "doha" } },                            // Qatar vs Doha GP
+            { "lusail", new[] { "doha" } },
+            { "portimao", new[] { "algarve" } },                       // Portugal vs Algarve GP
+            // 2024 special case
+            { "barcelona", new[] { "solidarity", "motul" } },          // Catalunya vs Solidarity GP
+        };
+
+        private Episode FindRacingEpisode(Series series, int season, string gpName, string sessionType, string racingClass)
+        {
+            _logger.Info("FindRacingEpisode called: Series='{0}', Season={1}, GP='{2}', Session='{3}', Class='{4}'", series.Title, season, gpName, sessionType, racingClass ?? "none");
+
+            if (string.IsNullOrWhiteSpace(gpName) || string.IsNullOrWhiteSpace(sessionType))
+            {
+                _logger.Debug("Racing episode search requires both GP name and session type");
+                return null;
+            }
+
+            var episodes = _episodeService.GetEpisodesBySeason(series.Id, season);
+
+            if (!episodes.Any())
+            {
+                _logger.Warn("No episodes found for season {0} in series '{1}' (ID: {2})", season, series.Title, series.Id);
+                return null;
+            }
+
+            _logger.Info("Found {0} episodes in season {1}", episodes.Count, season);
+
+            // Build list of GP name variations to search for
+            var normalizedGpName = gpName.CleanSeriesTitle();
+            var gpNameVariations = new List<string> { normalizedGpName, gpName.ToLower() };
+
+            // Add known variations from the mapping using STRICT matching
+            // CRITICAL: Use word boundary matching to prevent "australia" from matching "austria" variations
+            var matchedKeys = new List<KeyValuePair<string, string[]>>();
+
+            foreach (var kvp in GpNameVariations)
+            {
+                var cleanKey = kvp.Key.CleanSeriesTitle();
+
+                // Check if this key matches the GP name using STRICT rules
+                // 1. Exact match (case-insensitive)
+                if (string.Equals(normalizedGpName, cleanKey, StringComparison.OrdinalIgnoreCase))
+                {
+                    matchedKeys.Add(kvp);
+                    continue;
+                }
+
+                // 2. Word boundary match - use regex to ensure we match complete words
+                // This prevents "aus" from matching within "austria" or "australia"
+                try
+                {
+                    var keyPattern = $@"\b{Regex.Escape(cleanKey)}\b";
+                    var gpPattern = $@"\b{Regex.Escape(normalizedGpName)}\b";
+
+                    if (Regex.IsMatch(normalizedGpName, keyPattern, RegexOptions.IgnoreCase) ||
+                        Regex.IsMatch(cleanKey, gpPattern, RegexOptions.IgnoreCase))
+                    {
+                        matchedKeys.Add(kvp);
+                    }
+                }
+                catch (ArgumentException)
+                {
+                    // If regex fails, fall back to exact match only (already handled above)
+                }
+            }
+
+            // Sort by key length descending - prioritize longer/more specific keys
+            // "australia" (9 chars) will be processed before "aus" (3 chars)
+            foreach (var kvp in matchedKeys.OrderByDescending(k => k.Key.Length))
+            {
+                gpNameVariations.AddRange(kvp.Value);
+            }
+
+            gpNameVariations = gpNameVariations.Distinct().ToList();
+
+            _logger.Info("GP name variations for '{0}': [{1}]", gpName, string.Join(", ", gpNameVariations));
+            _logger.Info("TEST: About to normalize session type: {0}", sessionType);
+
+            var normalizedSession = sessionType.ToLower();
+
+            // Normalize "quali" and "qf" to "qualifying"
+            if (normalizedSession == "quali" || normalizedSession == "qf")
+            {
+                normalizedSession = "qualifying";
+            }
+
+            // Build list of session type variations to search for
+            // TVDB uses different naming conventions (e.g., "Q 1" vs "Q1" vs "Qualifying")
+            var sessionVariations = new List<string> { normalizedSession };
+
+            // Handle compound sessions like "fp4-quali", "fp4quali" - extract both parts
+            var compoundMatch = Regex.Match(normalizedSession, @"^(fp[1-4])[.\s_-]?(qualifying|quali)$", RegexOptions.IgnoreCase);
+            if (compoundMatch.Success)
+            {
+                // Add both the FP session and qualifying session variations
+                var fpPart = compoundMatch.Groups[1].Value.ToLower();
+                var fpNumber = fpPart.Replace("fp", "");
+                sessionVariations.AddRange(new[] { $"fp {fpNumber}", $"fp{fpNumber}", $"practice {fpNumber}", $"practice{fpNumber}", $"free practice {fpNumber}" });
+                sessionVariations.AddRange(new[] { "qualifying", "quali", "q 2", "q2", "q 1", "q1" });
+            }
+
+            // Handle Q1/Q2 variations (filenames use "Q1", TVDB uses "Q 1")
+            // Also handle "Qualifying One" and "Qualifying Two" style names
+            // IMPORTANT: Include "qualifying" prefix to avoid matching Free Practice Nr. 1/2
+            if (normalizedSession == "q1" || normalizedSession == "qualifying q1" || normalizedSession == "qualifyingq1" ||
+                normalizedSession == "qualifying one" || normalizedSession == "qualifyingone" ||
+                normalizedSession == "quali q1" || normalizedSession == "qualiq1")
+            {
+                // Include "qualifying 1" for TVDB titles like "MALAYSIA - Sepang - Qualifying 1"
+                sessionVariations.AddRange(new[] { "qualifying 1", "qualifying nr. 1", "qualifying q 1", "qualifying q1", "qualifying one", "quali nr. 1", "quali q 1", "quali q1", "q 1", "q1" });
+            }
+            else if (normalizedSession == "q2" || normalizedSession == "qualifying q2" || normalizedSession == "qualifyingq2" ||
+                     normalizedSession == "qualifying two" || normalizedSession == "qualifyingtwo" ||
+                     normalizedSession == "quali q2" || normalizedSession == "qualiq2")
+            {
+                // Include "qualifying 2" for TVDB titles like "MALAYSIA - Sepang - Qualifying 2"
+                sessionVariations.AddRange(new[] { "qualifying 2", "qualifying nr. 2", "qualifying q 2", "qualifying q2", "qualifying two", "quali nr. 2", "quali q 2", "quali q2", "q 2", "q2" });
+            }
+            else if (normalizedSession == "qualifying" || normalizedSession == "quali")
+            {
+                // Generic "Qualifying" without Q1/Q2 specifier - default to Q2 (final qualifying)
+                // Most scene releases use "Qualifying" to mean the full qualifying session or Q2
+                sessionVariations.AddRange(new[] { "q 2", "q2", "qual", "quali", "q 1", "q1" });
+            }
+
+            // Handle FP variations (FP1 = Free Practice 1 = Practice 1 = FP 1)
+            if (normalizedSession.StartsWith("fp"))
+            {
+                var fpNumber = normalizedSession.Replace("fp", "").Replace(" ", "").Replace(".", "");
+                sessionVariations.AddRange(new[] { $"fp {fpNumber}", $"fp{fpNumber}", $"practice {fpNumber}", $"practice{fpNumber}", $"free practice {fpNumber}" });
+            }
+            else if (normalizedSession.StartsWith("practice"))
+            {
+                var practiceNumber = normalizedSession.Replace("practice", "").Replace(" ", "").Replace(".", "");
+                if (!string.IsNullOrEmpty(practiceNumber))
+                {
+                    sessionVariations.AddRange(new[] { $"fp {practiceNumber}", $"fp{practiceNumber}", $"free practice {practiceNumber}" });
+                }
+            }
+
+            // Handle Warm Up variations
+            if (normalizedSession == "warmup" || normalizedSession == "warm up")
+            {
+                sessionVariations.AddRange(new[] { "warm up", "warmup", "warm-up" });
+            }
+
+            // Handle Test variations (pre-season, post-season testing)
+            if (normalizedSession.StartsWith("test"))
+            {
+                // Matches "test", "test afternoon", "test morning", "test day 1", etc.
+                sessionVariations.AddRange(new[] { "test", "testing", "shakedown" });
+
+                // Add specific variations if present
+                if (normalizedSession.Contains("afternoon"))
+                {
+                    sessionVariations.AddRange(new[] { "test afternoon", "afternoon session" });
+                }
+                else if (normalizedSession.Contains("morning"))
+                {
+                    sessionVariations.AddRange(new[] { "test morning", "morning session" });
+                }
+                else if (normalizedSession.Contains("day"))
+                {
+                    // Extract day number if present (e.g., "test day 1" -> "day 1")
+                    var dayMatch = Regex.Match(normalizedSession, @"day\s*(\d+)", RegexOptions.IgnoreCase);
+                    if (dayMatch.Success)
+                    {
+                        var dayNumber = dayMatch.Groups[1].Value;
+                        sessionVariations.AddRange(new[] { $"test day {dayNumber}", $"day {dayNumber}" });
+                    }
+                }
+            }
+
+            // Handle Sprint variations
+            // "Sprint" alone means Sprint Race, not Sprint Shootout/Sprint Qualifying
+            if (normalizedSession == "sprint")
+            {
+                // TVDB 2024 uses "Sprint Shootout" for qualifying, "Sprint" for the race
+                // TVDB 2025 uses "Sprint Qualifying" for qualifying, "Sprint Race" for the race
+                // File with just "Sprint" should match "Sprint Race" or standalone "Sprint", but NOT "Sprint Shootout" or "Sprint Qualifying"
+                sessionVariations.AddRange(new[] { "sprint race", "sprint" });
+            }
+            else if (normalizedSession == "sprint race" || normalizedSession == "sprintrace")
+            {
+                sessionVariations.AddRange(new[] { "sprint race", "sprint" });
+            }
+            else if (normalizedSession == "sprint qualifying" || normalizedSession == "sprint quali" || normalizedSession == "sprintqualifying")
+            {
+                sessionVariations.AddRange(new[] { "sprint qualifying", "sprint shootout" });
+            }
+            else if (normalizedSession == "sprint shootout" || normalizedSession == "sprintshootout")
+            {
+                sessionVariations.AddRange(new[] { "sprint shootout", "sprint qualifying" });
+            }
+
+            // Racing class is now passed directly from the parser (e.g., "moto2", "moto3", "motogp")
+            _logger.Debug("Searching for racing episode: GP='{0}' (variations: [{1}]), Session='{2}' (variations: [{3}]), Class='{4}'",
+                gpName, string.Join(", ", gpNameVariations), normalizedSession, string.Join(", ", sessionVariations), racingClass ?? "any");
+
+            // Helper function to check if episode title contains any GP name variation
+            bool TitleContainsGpName(string title)
+            {
+                var cleanTitle = title.CleanSeriesTitle().ToLower();
+                var lowerTitle = title.ToLower();
+                var matched = gpNameVariations.Any(gp =>
+                {
+                    var lowerGp = gp.ToLower();
+
+                    // Use word boundary matching on original title to prevent "spa" from matching "España"
+                    var pattern = $@"\b{Regex.Escape(lowerGp)}\b";
+                    if (Regex.IsMatch(lowerTitle, pattern, RegexOptions.IgnoreCase))
+                    {
+                        return true;
+                    }
+
+                    // CleanSeriesTitle removes spaces/punctuation, so use Contains() for cleaned titles
+                    // This handles accented characters: "Aragón" becomes "aragon" after cleaning
+                    // IMPORTANT: Only use Contains() for longer terms (5+ chars) to prevent false positives
+                    // Short codes like "aus" would match within "austria", "ger" within "german", etc.
+                    // The word boundary check above handles short codes correctly on the original title
+                    if (lowerGp.Length >= 5 && cleanTitle.Contains(lowerGp))
+                    {
+                        return true;
+                    }
+
+                    return false;
+                });
+
+                return matched;
+            }
+
+            // Find episode where title contains GP name, session type, and optionally the racing class
+            // Search each session variation in priority order (e.g., Q2 before Q1 when session is "Qualifying")
+            // Special handling for Sprint to avoid matching Sprint Shootout/Sprint Qualifying
+            Episode matchingEpisode = null;
+
+            foreach (var sessionVar in sessionVariations)
+            {
+                // Check for circuit-specific exclusions (used across all session types)
+                // IMPORTANT: Do this BEFORE class matching to ensure circuit-specific REQUIRE logic is enforced
+                var hasMonza = gpNameVariations.Any(v => v.ToLower().Contains("monza"));
+                var hasImola = gpNameVariations.Any(v => v.ToLower().Contains("imola") || v.ToLower().Contains("emilia"));
+                var hasMugello = gpNameVariations.Any(v => v.ToLower().Contains("mugello") || v.ToLower().Contains("toscana") || v.ToLower().Contains("tuscany"));
+
+                // Check for USA circuit-specific names
+                var hasCota = gpNameVariations.Any(v => v.ToLower().Contains("cota") || v.ToLower().Contains("austin"));
+                var hasLasVegas = gpNameVariations.Any(v => v.ToLower().Contains("las vegas") || v.ToLower().Contains("vegas"));
+                var hasMiami = gpNameVariations.Any(v => v.ToLower().Contains("miami"));
+
+                // Check for Spain circuit-specific names (mainly for MotoGP which has 4 Spanish circuits)
+                var hasJerez = gpNameVariations.Any(v => v.ToLower().Contains("jerez"));
+                var hasCatalunya = gpNameVariations.Any(v => v.ToLower().Contains("catalunya") || v.ToLower().Contains("catalonia") || v.ToLower().Contains("barcelona"));
+                var hasAragon = gpNameVariations.Any(v => v.ToLower().Contains("aragon"));
+                var hasValencia = gpNameVariations.Any(v => v.ToLower().Contains("valencia"));
+
+                // Check if circuit names actually appear in episode titles (TVDB doesn't always include circuit names)
+                // Only require circuit name if it exists in at least one episode title
+                // Use CleanSeriesTitle to remove accents (e.g., "Aragón" -> "Aragon")
+                var episodeHasJerez = hasJerez && episodes.Any(ep => ep.Title.CleanSeriesTitle().ToLower().Contains("jerez"));
+                var episodeHasCatalunya = hasCatalunya && episodes.Any(ep => ep.Title.CleanSeriesTitle().ToLower().Contains("catalunya") || ep.Title.CleanSeriesTitle().ToLower().Contains("catalonia") || ep.Title.CleanSeriesTitle().ToLower().Contains("barcelona"));
+                var episodeHasAragon = hasAragon && episodes.Any(ep => ep.Title.CleanSeriesTitle().ToLower().Contains("aragon"));
+                var episodeHasValencia = hasValencia && episodes.Any(ep => ep.Title.CleanSeriesTitle().ToLower().Contains("valencia"));
+                var episodeHasMugello = hasMugello && episodes.Any(ep => ep.Title.CleanSeriesTitle().ToLower().Contains("mugello") || ep.Title.CleanSeriesTitle().ToLower().Contains("toscana") || ep.Title.CleanSeriesTitle().ToLower().Contains("tuscan"));
+
+                _logger.Info($"Circuit flags: hasAragon={hasAragon}, episodeHasAragon={episodeHasAragon}, hasJerez={hasJerez}, episodeHasJerez={episodeHasJerez}, hasCatalunya={hasCatalunya}, episodeHasCatalunya={episodeHasCatalunya}, hasValencia={hasValencia}, episodeHasValencia={episodeHasValencia}");
+
+                if (racingClass != null)
+                {
+                    // For MotoGP series, prefer episodes that explicitly mention the class
+                    // This handles TVDB entries like "SAN MARINO - Misano - MotoGP race" vs "Moto3 race"
+                    // IMPORTANT: Also enforce circuit-specific REQUIRE logic here to prevent mismatches
+
+                    // Helper to build class-specific query with circuit requirements
+                    Func<Episode, bool> BuildClassMatchPredicate(string requiredInTitle = null, string[] excludeFromTitle = null)
+                    {
+                        return ep => {
+                            if (!TitleContainsGpName(ep.Title)) return false;
+                            if (!ep.Title.ToLower().Contains(sessionVar.ToLower())) return false;
+                            if (racingClass != null && !ep.Title.ToLower().Contains(racingClass.ToLower())) return false;
+                            // Use CleanSeriesTitle to remove accents when checking required title (e.g., "Aragón" -> "Aragon")
+                            if (requiredInTitle != null && !ep.Title.CleanSeriesTitle().ToLower().Contains(requiredInTitle.ToLower())) return false;
+                            // Exclude unwanted terms (e.g., other Spain circuits when matching Aragon)
+                            if (excludeFromTitle != null && excludeFromTitle.Any(exclude => ep.Title.CleanSeriesTitle().ToLower().Contains(exclude))) return false;
+                            // Exclude "Sprint Race" episodes when matching plain "Race" session
+                            if (sessionVar.ToLower() == "race" && ep.Title.ToLower().Contains("sprint")) return false;
+                            return true;
+                        };
+                    }
+
+                    // Apply circuit-specific REQUIRE logic for class matching (only if circuit name appears in TVDB)
+                    // IMPORTANT: Check most specific circuits first to avoid generic "Spain" matching wrong circuit
+                    if (episodeHasAragon)
+                    {
+                        _logger.Info($"Aragon circuit detected in file. hasAragon={hasAragon}, episodeHasAragon={episodeHasAragon}");
+                        _logger.Info($"Searching for episodes with 'aragon' in title, excluding jerez/catalunya/valencia");
+                        _logger.Info($"Total episodes to check: {episodes.Count}");
+
+                        var predicate = BuildClassMatchPredicate("aragon", new[] { "jerez", "catalunya", "catalonia", "barcelona", "valencia" });
+
+                        // Log each episode evaluation
+                        foreach (var ep in episodes)
+                        {
+                            var epLower = ep.Title.ToLower();
+                            var epClean = ep.Title.CleanSeriesTitle().ToLower();
+                            var hasGpName = TitleContainsGpName(ep.Title);
+                            var hasSession = epLower.Contains(sessionVar.ToLower());
+                            var hasClass = racingClass != null && epLower.Contains(racingClass.ToLower());
+                            var hasAragonTitle = epClean.Contains("aragon");
+                            var hasExcluded = new[] { "jerez", "catalunya", "catalonia", "barcelona", "valencia" }.Any(ex => epClean.Contains(ex));
+                            var hasSprint = epLower.Contains("sprint");
+                            var matches = predicate(ep);
+
+                            if (hasGpName || hasAragonTitle || hasExcluded)
+                            {
+                                _logger.Info($"  Ep {ep.Id} '{ep.Title}': gpName={hasGpName}, session={hasSession}, class={hasClass}, hasAragon={hasAragonTitle}, excluded={hasExcluded}, sprint={hasSprint}, MATCH={matches}");
+                            }
+                        }
+
+                        // Require "aragon" and exclude other Spain circuits (Jerez, Catalunya, Valencia)
+                        matchingEpisode = episodes.FirstOrDefault(ep => predicate(ep));
+
+                        if (matchingEpisode != null)
+                        {
+                            _logger.Info($"Aragon match found: Episode {matchingEpisode.Id} '{matchingEpisode.Title}'");
+                        }
+                        else
+                        {
+                            _logger.Info($"No Aragon match found with exclusions!");
+                        }
+                    }
+                    else if (episodeHasCatalunya)
+                    {
+                        matchingEpisode = episodes.FirstOrDefault(ep =>
+                            (ep.Title.ToLower().Contains("catalunya") || ep.Title.ToLower().Contains("catalonia") || ep.Title.ToLower().Contains("barcelona")) &&
+                            BuildClassMatchPredicate()(ep));
+                    }
+                    else if (episodeHasJerez)
+                    {
+                        matchingEpisode = episodes.FirstOrDefault(ep => BuildClassMatchPredicate("jerez")(ep));
+                    }
+                    else if (episodeHasValencia)
+                    {
+                        matchingEpisode = episodes.FirstOrDefault(ep => BuildClassMatchPredicate("valencia")(ep));
+                    }
+                    else if (hasLasVegas)
+                    {
+                        matchingEpisode = episodes.FirstOrDefault(ep =>
+                            (ep.Title.ToLower().Contains("las vegas") || ep.Title.ToLower().Contains("vegas")) &&
+                            BuildClassMatchPredicate()(ep));
+                    }
+                    else if (hasMiami)
+                    {
+                        matchingEpisode = episodes.FirstOrDefault(ep => BuildClassMatchPredicate("miami")(ep));
+                    }
+                    else if (hasImola)
+                    {
+                        matchingEpisode = episodes.FirstOrDefault(ep =>
+                            (ep.Title.ToLower().Contains("emilia") || ep.Title.ToLower().Contains("imola")) &&
+                            BuildClassMatchPredicate()(ep));
+                    }
+                    else if (episodeHasMugello)
+                    {
+                        matchingEpisode = episodes.FirstOrDefault(ep =>
+                            (ep.Title.ToLower().Contains("toscana") || ep.Title.ToLower().Contains("tuscan") || ep.Title.ToLower().Contains("mugello")) &&
+                            BuildClassMatchPredicate()(ep));
+                    }
+                    else
+                    {
+                        matchingEpisode = episodes.FirstOrDefault(ep => BuildClassMatchPredicate()(ep));
+                    }
+
+                    if (matchingEpisode != null)
+                    {
+                        _logger.Info($"Class-based match found: Episode {matchingEpisode.Id} '{matchingEpisode.Title}'");
+                    }
+                    else
+                    {
+                        _logger.Info($"No class-based match found, will try fallback");
+                    }
+                }
+
+                // Fallback: match without class requirement (for series like F1 that don't have multiple classes)
+                if (matchingEpisode == null)
+                {
+                    var lowerSessionVar = sessionVar.ToLower();
+
+                    // Special handling: if searching for plain "race", exclude episodes with "sprint"
+                    // This prevents "Race" files from matching "Sprint Race" episodes
+                    if (lowerSessionVar == "race")
+                    {
+                        matchingEpisode = episodes.FirstOrDefault(ep =>
+                            TitleContainsGpName(ep.Title) &&
+                            ep.Title.ToLower().Contains(lowerSessionVar) &&
+                            !ep.Title.ToLower().Contains("sprint"));
+                    }
+                    // Special handling: if searching for "sprint" or "sprint race", exclude episodes with "shootout" or "qualifying"
+                    else if (lowerSessionVar == "sprint" || lowerSessionVar == "sprint race")
+                    {
+                        if (hasMonza && !hasImola && !hasMugello)
+                        {
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(lowerSessionVar) &&
+                                !ep.Title.ToLower().Contains("shootout") &&
+                                !ep.Title.ToLower().Contains("qualifying") &&
+                                !ep.Title.ToLower().Contains("emilia") &&
+                                !ep.Title.ToLower().Contains("imola") &&
+                                !ep.Title.ToLower().Contains("toscana") &&
+                                !ep.Title.ToLower().Contains("tuscan") &&
+                                !ep.Title.ToLower().Contains("mugello"));
+                        }
+                        else if (hasImola && !hasMonza && !hasMugello)
+                        {
+                            // File has Imola - REQUIRE Emilia/Imola in episode title (don't match generic "Italy")
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(lowerSessionVar) &&
+                                !ep.Title.ToLower().Contains("shootout") &&
+                                !ep.Title.ToLower().Contains("qualifying") &&
+                                (ep.Title.ToLower().Contains("emilia") || ep.Title.ToLower().Contains("imola")));
+                        }
+                        else if (episodeHasMugello && !hasMonza && !hasImola)
+                        {
+                            // File has Mugello - REQUIRE Toscana/Tuscan/Mugello in episode title (only if TVDB has it)
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(lowerSessionVar) &&
+                                !ep.Title.ToLower().Contains("shootout") &&
+                                !ep.Title.ToLower().Contains("qualifying") &&
+                                (ep.Title.ToLower().Contains("toscana") || ep.Title.ToLower().Contains("tuscan") || ep.Title.ToLower().Contains("mugello")));
+                        }
+                        else if (hasMugello && !hasMonza && !hasImola)
+                        {
+                            // File has Mugello but TVDB doesn't use circuit name - match without circuit REQUIRE
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(lowerSessionVar) &&
+                                !ep.Title.ToLower().Contains("shootout") &&
+                                !ep.Title.ToLower().Contains("qualifying"));
+                        }
+                        else if (hasLasVegas)
+                        {
+                            // File has Las Vegas - REQUIRE Las Vegas/Vegas in episode title (don't match generic "United States")
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(lowerSessionVar) &&
+                                !ep.Title.ToLower().Contains("shootout") &&
+                                !ep.Title.ToLower().Contains("qualifying") &&
+                                (ep.Title.ToLower().Contains("las vegas") || ep.Title.ToLower().Contains("vegas")));
+                        }
+                        else if (hasMiami)
+                        {
+                            // File has Miami - REQUIRE Miami in episode title (don't match generic "United States")
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(lowerSessionVar) &&
+                                !ep.Title.ToLower().Contains("shootout") &&
+                                !ep.Title.ToLower().Contains("qualifying") &&
+                                ep.Title.ToLower().Contains("miami"));
+                        }
+                        else if (episodeHasJerez)
+                        {
+                            // File has Jerez and TVDB has Jerez - REQUIRE it
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(lowerSessionVar) &&
+                                !ep.Title.ToLower().Contains("shootout") &&
+                                !ep.Title.ToLower().Contains("qualifying") &&
+                                ep.Title.ToLower().Contains("jerez"));
+                        }
+                        else if (hasJerez)
+                        {
+                            // File has Jerez but TVDB doesn't - match Spain without REQUIRE
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(lowerSessionVar) &&
+                                !ep.Title.ToLower().Contains("shootout") &&
+                                !ep.Title.ToLower().Contains("qualifying"));
+                        }
+                        else if (episodeHasCatalunya)
+                        {
+                            // File has Catalunya and TVDB has it - REQUIRE it
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(lowerSessionVar) &&
+                                !ep.Title.ToLower().Contains("shootout") &&
+                                !ep.Title.ToLower().Contains("qualifying") &&
+                                (ep.Title.ToLower().Contains("catalunya") || ep.Title.ToLower().Contains("catalonia") || ep.Title.ToLower().Contains("barcelona")));
+                        }
+                        else if (hasCatalunya)
+                        {
+                            // File has Catalunya but TVDB doesn't - match Spain without REQUIRE
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(lowerSessionVar) &&
+                                !ep.Title.ToLower().Contains("shootout") &&
+                                !ep.Title.ToLower().Contains("qualifying"));
+                        }
+                        else if (episodeHasAragon)
+                        {
+                            // File has Aragon and TVDB has it - REQUIRE it
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(lowerSessionVar) &&
+                                !ep.Title.ToLower().Contains("shootout") &&
+                                !ep.Title.ToLower().Contains("qualifying") &&
+                                ep.Title.ToLower().Contains("aragon"));
+                        }
+                        else if (hasAragon)
+                        {
+                            // File has Aragon but TVDB doesn't - match Spain without REQUIRE
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(lowerSessionVar) &&
+                                !ep.Title.ToLower().Contains("shootout") &&
+                                !ep.Title.ToLower().Contains("qualifying"));
+                        }
+                        else if (episodeHasValencia)
+                        {
+                            // File has Valencia and TVDB has it - REQUIRE it
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(lowerSessionVar) &&
+                                !ep.Title.ToLower().Contains("shootout") &&
+                                !ep.Title.ToLower().Contains("qualifying") &&
+                                ep.Title.ToLower().Contains("valencia"));
+                        }
+                        else if (hasValencia)
+                        {
+                            // File has Valencia but TVDB doesn't - match Spain without REQUIRE
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(lowerSessionVar) &&
+                                !ep.Title.ToLower().Contains("shootout") &&
+                                !ep.Title.ToLower().Contains("qualifying"));
+                        }
+                        else
+                        {
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(lowerSessionVar) &&
+                                !ep.Title.ToLower().Contains("shootout") &&
+                                !ep.Title.ToLower().Contains("qualifying"));
+                        }
+                    }
+                    // Special handling: if searching for "race", exclude episodes with "sprint" to avoid matching "Sprint Race"
+                    else if (lowerSessionVar == "race")
+                    {
+                        if (hasMonza && !hasImola && !hasMugello)
+                        {
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(lowerSessionVar) &&
+                                !ep.Title.ToLower().Contains("sprint") &&
+                                !ep.Title.ToLower().Contains("emilia") &&
+                                !ep.Title.ToLower().Contains("imola") &&
+                                !ep.Title.ToLower().Contains("toscana") &&
+                                !ep.Title.ToLower().Contains("tuscan") &&
+                                !ep.Title.ToLower().Contains("mugello"));
+                        }
+                        else if (hasImola && !hasMonza && !hasMugello)
+                        {
+                            // File has Imola - REQUIRE Emilia/Imola in episode title (don't match generic "Italy")
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(lowerSessionVar) &&
+                                !ep.Title.ToLower().Contains("sprint") &&
+                                (ep.Title.ToLower().Contains("emilia") || ep.Title.ToLower().Contains("imola")));
+                        }
+                        else if (hasMugello && !hasMonza && !hasImola)
+                        {
+                            // File has Mugello - REQUIRE Toscana/Tuscan/Mugello in episode title (don't match generic "Italy")
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(lowerSessionVar) &&
+                                !ep.Title.ToLower().Contains("sprint") &&
+                                (ep.Title.ToLower().Contains("toscana") || ep.Title.ToLower().Contains("tuscan") || ep.Title.ToLower().Contains("mugello")));
+                        }
+                        else if (hasLasVegas)
+                        {
+                            // File has Las Vegas - REQUIRE Las Vegas/Vegas in episode title (don't match generic "United States")
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(lowerSessionVar) &&
+                                !ep.Title.ToLower().Contains("sprint") &&
+                                (ep.Title.ToLower().Contains("las vegas") || ep.Title.ToLower().Contains("vegas")));
+                        }
+                        else if (hasMiami)
+                        {
+                            // File has Miami - REQUIRE Miami in episode title (don't match generic "United States")
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(lowerSessionVar) &&
+                                !ep.Title.ToLower().Contains("sprint") &&
+                                ep.Title.ToLower().Contains("miami"));
+                        }
+                        else if (episodeHasJerez)
+                        {
+                            // File has Jerez and TVDB has it - REQUIRE it
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(lowerSessionVar) &&
+                                !ep.Title.ToLower().Contains("sprint") &&
+                                ep.Title.ToLower().Contains("jerez"));
+                        }
+                        else if (hasJerez)
+                        {
+                            // File has Jerez but TVDB doesn't - match Spain without REQUIRE
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(lowerSessionVar) &&
+                                !ep.Title.ToLower().Contains("sprint"));
+                        }
+                        else if (episodeHasCatalunya)
+                        {
+                            // File has Catalunya and TVDB has it - REQUIRE it
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(lowerSessionVar) &&
+                                !ep.Title.ToLower().Contains("sprint") &&
+                                (ep.Title.ToLower().Contains("catalunya") || ep.Title.ToLower().Contains("catalonia") || ep.Title.ToLower().Contains("barcelona")));
+                        }
+                        else if (hasCatalunya)
+                        {
+                            // File has Catalunya but TVDB doesn't - match Spain without REQUIRE
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(lowerSessionVar) &&
+                                !ep.Title.ToLower().Contains("sprint"));
+                        }
+                        else if (episodeHasAragon)
+                        {
+                            // File has Aragon and TVDB has it - REQUIRE it
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(lowerSessionVar) &&
+                                !ep.Title.ToLower().Contains("sprint") &&
+                                ep.Title.ToLower().Contains("aragon"));
+                        }
+                        else if (hasAragon)
+                        {
+                            // File has Aragon but TVDB doesn't - match Spain without REQUIRE
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(lowerSessionVar) &&
+                                !ep.Title.ToLower().Contains("sprint"));
+                        }
+                        else if (episodeHasValencia)
+                        {
+                            // File has Valencia and TVDB has it - REQUIRE it
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(lowerSessionVar) &&
+                                !ep.Title.ToLower().Contains("sprint") &&
+                                ep.Title.ToLower().Contains("valencia"));
+                        }
+                        else if (hasValencia)
+                        {
+                            // File has Valencia but TVDB doesn't - match Spain without REQUIRE
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(lowerSessionVar) &&
+                                !ep.Title.ToLower().Contains("sprint"));
+                        }
+                        else
+                        {
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(lowerSessionVar) &&
+                                !ep.Title.ToLower().Contains("sprint"));
+                        }
+                    }
+                    // Special handling: if searching for "qualifying", exclude episodes with "sprint" to avoid matching "Sprint Qualifying"
+                    else if (lowerSessionVar == "qualifying")
+                    {
+                        if (hasMonza && !hasImola && !hasMugello)
+                        {
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(lowerSessionVar) &&
+                                !ep.Title.ToLower().Contains("sprint") &&
+                                !ep.Title.ToLower().Contains("emilia") &&
+                                !ep.Title.ToLower().Contains("imola") &&
+                                !ep.Title.ToLower().Contains("toscana") &&
+                                !ep.Title.ToLower().Contains("tuscan") &&
+                                !ep.Title.ToLower().Contains("mugello"));
+                        }
+                        else if (hasImola && !hasMonza && !hasMugello)
+                        {
+                            // File has Imola - REQUIRE Emilia/Imola in episode title (don't match generic "Italy")
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(lowerSessionVar) &&
+                                !ep.Title.ToLower().Contains("sprint") &&
+                                (ep.Title.ToLower().Contains("emilia") || ep.Title.ToLower().Contains("imola")));
+                        }
+                        else if (episodeHasMugello && !hasMonza && !hasImola)
+                        {
+                            // File has Mugello and TVDB has it - REQUIRE it
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(lowerSessionVar) &&
+                                !ep.Title.ToLower().Contains("sprint") &&
+                                (ep.Title.ToLower().Contains("toscana") || ep.Title.ToLower().Contains("tuscan") || ep.Title.ToLower().Contains("mugello")));
+                        }
+                        else if (hasMugello && !hasMonza && !hasImola)
+                        {
+                            // File has Mugello but TVDB doesn't - match Italy without REQUIRE
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(lowerSessionVar) &&
+                                !ep.Title.ToLower().Contains("sprint"));
+                        }
+                        else if (hasLasVegas)
+                        {
+                            // File has Las Vegas - REQUIRE Las Vegas/Vegas in episode title (don't match generic "United States")
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(lowerSessionVar) &&
+                                !ep.Title.ToLower().Contains("sprint") &&
+                                (ep.Title.ToLower().Contains("las vegas") || ep.Title.ToLower().Contains("vegas")));
+                        }
+                        else if (hasMiami)
+                        {
+                            // File has Miami - REQUIRE Miami in episode title (don't match generic "United States")
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(lowerSessionVar) &&
+                                !ep.Title.ToLower().Contains("sprint") &&
+                                ep.Title.ToLower().Contains("miami"));
+                        }
+                        else if (episodeHasJerez)
+                        {
+                            // File has Jerez and TVDB has it - REQUIRE it
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(lowerSessionVar) &&
+                                !ep.Title.ToLower().Contains("sprint") &&
+                                ep.Title.ToLower().Contains("jerez"));
+                        }
+                        else if (hasJerez)
+                        {
+                            // File has Jerez but TVDB doesn't - match Spain without REQUIRE
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(lowerSessionVar) &&
+                                !ep.Title.ToLower().Contains("sprint"));
+                        }
+                        else if (episodeHasCatalunya)
+                        {
+                            // File has Catalunya and TVDB has it - REQUIRE it
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(lowerSessionVar) &&
+                                !ep.Title.ToLower().Contains("sprint") &&
+                                (ep.Title.ToLower().Contains("catalunya") || ep.Title.ToLower().Contains("catalonia") || ep.Title.ToLower().Contains("barcelona")));
+                        }
+                        else if (hasCatalunya)
+                        {
+                            // File has Catalunya but TVDB doesn't - match Spain without REQUIRE
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(lowerSessionVar) &&
+                                !ep.Title.ToLower().Contains("sprint"));
+                        }
+                        else if (episodeHasAragon)
+                        {
+                            // File has Aragon and TVDB has it - REQUIRE it
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(lowerSessionVar) &&
+                                !ep.Title.ToLower().Contains("sprint") &&
+                                ep.Title.ToLower().Contains("aragon"));
+                        }
+                        else if (hasAragon)
+                        {
+                            // File has Aragon but TVDB doesn't - match Spain without REQUIRE
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(lowerSessionVar) &&
+                                !ep.Title.ToLower().Contains("sprint"));
+                        }
+                        else if (episodeHasValencia)
+                        {
+                            // File has Valencia and TVDB has it - REQUIRE it
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(lowerSessionVar) &&
+                                !ep.Title.ToLower().Contains("sprint") &&
+                                ep.Title.ToLower().Contains("valencia"));
+                        }
+                        else if (hasValencia)
+                        {
+                            // File has Valencia but TVDB doesn't - match Spain without REQUIRE
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(lowerSessionVar) &&
+                                !ep.Title.ToLower().Contains("sprint"));
+                        }
+                        else
+                        {
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(lowerSessionVar) &&
+                                !ep.Title.ToLower().Contains("sprint"));
+                        }
+                    }
+                    else
+                    {
+                        // Use the circuit-specific exclusions already declared above
+                        if (hasMonza && !hasImola && !hasMugello)
+                        {
+                            // File has Monza - exclude Emilia-Romagna/Imola and Toscana/Mugello episodes
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(sessionVar) &&
+                                !ep.Title.ToLower().Contains("emilia") &&
+                                !ep.Title.ToLower().Contains("imola") &&
+                                !ep.Title.ToLower().Contains("toscana") &&
+                                !ep.Title.ToLower().Contains("tuscan") &&
+                                !ep.Title.ToLower().Contains("mugello"));
+                        }
+                        else if (hasImola && !hasMonza && !hasMugello)
+                        {
+                            // File has Imola - REQUIRE Emilia/Imola in episode title (don't match generic "Italy")
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(sessionVar) &&
+                                (ep.Title.ToLower().Contains("emilia") || ep.Title.ToLower().Contains("imola")));
+                        }
+                        else if (episodeHasMugello && !hasMonza && !hasImola)
+                        {
+                            // File has Mugello and TVDB has it - REQUIRE it
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(sessionVar) &&
+                                (ep.Title.ToLower().Contains("toscana") || ep.Title.ToLower().Contains("tuscan") || ep.Title.ToLower().Contains("mugello")));
+                        }
+                        else if (hasMugello && !hasMonza && !hasImola)
+                        {
+                            // File has Mugello but TVDB doesn't - match Italy without REQUIRE
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(sessionVar));
+                        }
+                        else if (hasLasVegas)
+                        {
+                            // File has Las Vegas - REQUIRE Las Vegas/Vegas in episode title (don't match generic "United States")
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(sessionVar) &&
+                                (ep.Title.ToLower().Contains("las vegas") || ep.Title.ToLower().Contains("vegas")));
+                        }
+                        else if (hasMiami)
+                        {
+                            // File has Miami - REQUIRE Miami in episode title (don't match generic "United States")
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(sessionVar) &&
+                                ep.Title.ToLower().Contains("miami"));
+                        }
+                        else if (episodeHasJerez)
+                        {
+                            // File has Jerez and TVDB has it - REQUIRE it
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(sessionVar) &&
+                                ep.Title.ToLower().Contains("jerez"));
+                        }
+                        else if (hasJerez)
+                        {
+                            // File has Jerez but TVDB doesn't - match Spain without REQUIRE
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(sessionVar));
+                        }
+                        else if (episodeHasCatalunya)
+                        {
+                            // File has Catalunya and TVDB has it - REQUIRE it
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(sessionVar) &&
+                                (ep.Title.ToLower().Contains("catalunya") || ep.Title.ToLower().Contains("catalonia") || ep.Title.ToLower().Contains("barcelona")));
+                        }
+                        else if (hasCatalunya)
+                        {
+                            // File has Catalunya but TVDB doesn't - match Spain without REQUIRE
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(sessionVar));
+                        }
+                        else if (episodeHasAragon)
+                        {
+                            // File has Aragon and TVDB has it - REQUIRE it
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(sessionVar) &&
+                                ep.Title.ToLower().Contains("aragon"));
+                        }
+                        else if (hasAragon)
+                        {
+                            // File has Aragon but TVDB doesn't - match Spain without REQUIRE
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(sessionVar));
+                        }
+                        else if (episodeHasValencia)
+                        {
+                            // File has Valencia and TVDB has it - REQUIRE it
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(sessionVar) &&
+                                ep.Title.ToLower().Contains("valencia"));
+                        }
+                        else if (hasValencia)
+                        {
+                            // File has Valencia but TVDB doesn't - match Spain without REQUIRE
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(sessionVar));
+                        }
+                        else
+                        {
+                            // No circuit-specific exclusions needed
+                            matchingEpisode = episodes.FirstOrDefault(ep =>
+                                TitleContainsGpName(ep.Title) &&
+                                ep.Title.ToLower().Contains(sessionVar));
+                        }
+                    }
+                }
+
+                if (matchingEpisode != null)
+                {
+                    break;
+                }
+            }
+
+            if (matchingEpisode != null)
+            {
+                _logger.Info("SUCCESS: Found racing episode: S{0:00}E{1:00} - {2}", matchingEpisode.SeasonNumber, matchingEpisode.EpisodeNumber, matchingEpisode.Title);
+            }
+            else
+            {
+                _logger.Warn("FAILURE: No matching racing episode found for GP '{0}' Session '{1}' in season {2}", gpName, sessionType, season);
+                _logger.Info("Searched {0} episodes. Sample episode titles:", episodes.Count);
+                foreach (var ep in episodes.Take(5))
+                {
+                    _logger.Info("  - S{0:00}E{1:00}: {2}", ep.SeasonNumber, ep.EpisodeNumber, ep.Title);
+                }
+                if (episodes.Count > 5)
+                {
+                    _logger.Info("  ... and {0} more episodes", episodes.Count - 5);
+                }
+            }
+
+            return matchingEpisode;
+        }
+    }
+}
