@@ -23,6 +23,12 @@ const seriesTypeList = [
       return translate('Standard');
     },
   },
+  {
+    id: 'racing',
+    get name() {
+      return translate('Racing');
+    },
+  },
 ];
 
 type SeriesTypeFilterBuilderRowValueProps<T> = Omit<

@@ -26,6 +26,8 @@ export const defaultState = {
   isFetching: false,
   isPopulated: false,
   error: null,
+  searchWarning: null,
+  searchInfo: null,
   items: [],
   sortKey: 'releaseWeight',
   sortDirection: sortDirections.ASCENDING,
@@ -310,9 +312,38 @@ const fetchReleasesHelper = createFetchHandler(section, '/release');
 export const actionHandlers = handleThunks({
 
   [FETCH_RELEASES]: function(getState, payload, dispatch) {
-    const abortRequest = fetchReleasesHelper(getState, payload, dispatch);
+    dispatch({
+      type: `${section}/fetch`,
+      payload
+    });
 
-    abortCurrentRequest = abortRequest;
+    const { request, abortRequest } = createAjaxRequest({
+      url: '/release',
+      data: payload
+    });
+
+    request.done((data, textStatus, xhr) => {
+      const searchWarning = xhr.getResponseHeader('X-Search-Warning');
+      const searchInfo = xhr.getResponseHeader('X-Search-Info');
+
+      dispatch({
+        type: `${section}/fetchSuccess`,
+        payload: {
+          resource: data,
+          searchWarning: searchWarning || null,
+          searchInfo: searchInfo || null
+        }
+      });
+    });
+
+    request.fail((xhr) => {
+      dispatch({
+        type: `${section}/fetchError`,
+        payload: { error: xhr }
+      });
+    });
+
+    return abortRequest;
   },
 
   [CANCEL_FETCH_RELEASES]: function(getState, payload, dispatch) {
@@ -360,6 +391,39 @@ export const actionHandlers = handleThunks({
 // Reducers
 
 export const reducers = createHandleActions({
+
+  [`${section}/fetch`]: (state) => {
+    return {
+      ...state,
+      isFetching: true,
+      isPopulated: false,
+      error: null,
+      items: [],
+      searchWarning: null,
+      searchInfo: null
+    };
+  },
+
+  [`${section}/fetchSuccess`]: (state, { payload }) => {
+    return {
+      ...state,
+      isFetching: false,
+      isPopulated: true,
+      error: null,
+      items: payload.resource || payload,
+      searchWarning: payload.searchWarning || null,
+      searchInfo: payload.searchInfo || null
+    };
+  },
+
+  [`${section}/fetchError`]: (state, { payload }) => {
+    return {
+      ...state,
+      isFetching: false,
+      isPopulated: false,
+      error: payload.error
+    };
+  },
 
   [CLEAR_RELEASES]: (state) => {
     const {

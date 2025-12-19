@@ -140,7 +140,46 @@ namespace NzbDrone.Core.Download.TrackedDownloads
                     trackedDownload.Indexer = grabbedEvent?.Data?.GetValueOrDefault("indexer");
                     trackedDownload.Added = grabbedEvent?.Date;
 
-                    if (parsedEpisodeInfo == null ||
+                    // Check if this was an Interactive Search grab - if so, always use the episode IDs from history
+                    // because the user explicitly selected which episode to download for, and we should trust that
+                    // over any parser result (which may match incorrectly for ambiguous releases like racing content)
+                    var releaseSourceStr = grabbedEvent?.Data?.GetValueOrDefault(EpisodeHistory.RELEASE_SOURCE);
+                    _logger.Info("TrackedDownload: releaseSourceStr={0}, grabbedEvent exists={1}, historyItems count={2}",
+                        releaseSourceStr ?? "null", grabbedEvent != null, historyItems.Count);
+
+                    var isInteractiveSearch = releaseSourceStr != null &&
+                        Enum.TryParse<ReleaseSourceType>(releaseSourceStr, out var releaseSource) &&
+                        releaseSource == ReleaseSourceType.InteractiveSearch;
+
+                    _logger.Info("TrackedDownload: isInteractiveSearch={0}", isInteractiveSearch);
+
+                    var historyEpisodeIds = historyItems
+                        .Where(v => v.EventType == EpisodeHistoryEventType.Grabbed)
+                        .Select(h => h.EpisodeId)
+                        .Distinct()
+                        .ToList();
+
+                    _logger.Info("TrackedDownload: historyEpisodeIds={0}", string.Join(", ", historyEpisodeIds));
+
+                    if (isInteractiveSearch && historyEpisodeIds.Any())
+                    {
+                        // For Interactive Search, always use the episodes from history - they represent
+                        // what the user explicitly selected, not what the parser guessed
+                        _logger.Info("Interactive Search grab detected, using episode IDs from history: {0}", string.Join(", ", historyEpisodeIds));
+
+                        trackedDownload.RemoteEpisode = _parsingService.Map(
+                            parsedEpisodeInfo ?? Parser.Parser.ParseTitle(firstHistoryItem.SourceTitle),
+                            firstHistoryItem.SeriesId,
+                            historyEpisodeIds);
+
+                        // CRITICAL: Set ReleaseSource so ImportDecisionMaker knows this was an Interactive Search
+                        if (trackedDownload.RemoteEpisode != null)
+                        {
+                            trackedDownload.RemoteEpisode.ReleaseSource = ReleaseSourceType.InteractiveSearch;
+                            _logger.Info("Set RemoteEpisode.ReleaseSource to InteractiveSearch");
+                        }
+                    }
+                    else if (parsedEpisodeInfo == null ||
                         trackedDownload.RemoteEpisode?.Series == null ||
                         trackedDownload.RemoteEpisode.Episodes.Empty())
                     {
@@ -153,8 +192,7 @@ namespace NzbDrone.Core.Download.TrackedDownloads
                         {
                             trackedDownload.RemoteEpisode = _parsingService.Map(parsedEpisodeInfo,
                                 firstHistoryItem.SeriesId,
-                                historyItems.Where(v => v.EventType == EpisodeHistoryEventType.Grabbed)
-                                    .Select(h => h.EpisodeId).Distinct());
+                                historyEpisodeIds);
                         }
                     }
 

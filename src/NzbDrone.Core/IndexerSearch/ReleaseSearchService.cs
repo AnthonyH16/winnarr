@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using NLog;
 using NzbDrone.Common.Extensions;
@@ -23,6 +24,8 @@ namespace NzbDrone.Core.IndexerSearch
         Task<List<DownloadDecision>> EpisodeSearch(Episode episode, bool userInvokedSearch, bool interactiveSearch);
         Task<List<DownloadDecision>> SeasonSearch(int seriesId, int seasonNumber, bool missingOnly, bool monitoredOnly, bool userInvokedSearch, bool interactiveSearch);
         Task<List<DownloadDecision>> SeasonSearch(int seriesId, int seasonNumber, List<Episode> episodes, bool monitoredOnly, bool userInvokedSearch, bool interactiveSearch);
+        Task<List<DownloadDecision>> CustomQuerySearch(int episodeId, string query, bool userInvokedSearch, bool interactiveSearch);
+        Task<List<DownloadDecision>> CustomQuerySeasonSearch(int seriesId, int seasonNumber, string query, bool userInvokedSearch, bool interactiveSearch);
     }
 
     public class ReleaseSearchService : ISearchForReleases
@@ -33,6 +36,11 @@ namespace NzbDrone.Core.IndexerSearch
         private readonly IEpisodeService _episodeService;
         private readonly IMakeDownloadDecision _makeDownloadDecision;
         private readonly Logger _logger;
+
+        // Static cache for search warnings and info (keyed by episode ID for episode searches, or "s{seriesId}_{seasonNumber}" for season searches)
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<int, string> _searchWarnings = new System.Collections.Concurrent.ConcurrentDictionary<int, string>();
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<int, string> _searchInfos = new System.Collections.Concurrent.ConcurrentDictionary<int, string>();
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> _seasonSearchInfos = new System.Collections.Concurrent.ConcurrentDictionary<string, string>();
 
         public ReleaseSearchService(IIndexerFactory indexerFactory,
                                 ISceneMappingService sceneMapping,
@@ -47,6 +55,27 @@ namespace NzbDrone.Core.IndexerSearch
             _episodeService = episodeService;
             _makeDownloadDecision = makeDownloadDecision;
             _logger = logger;
+        }
+
+        public static string GetSearchWarning(int episodeId)
+        {
+            _searchWarnings.TryRemove(episodeId, out var warning);
+            Console.WriteLine($"[GetSearchWarning] Episode {episodeId} - Returning: '{warning ?? "(null)"}', Thread: {System.Threading.Thread.CurrentThread.ManagedThreadId}");
+            return warning;
+        }
+
+        public static string GetSearchInfo(int episodeId)
+        {
+            _searchInfos.TryRemove(episodeId, out var info);
+            return info;
+        }
+
+        public static string GetSeasonSearchInfo(int seriesId, int seasonNumber)
+        {
+            var key = $"s{seriesId}_{seasonNumber}";
+            _seasonSearchInfos.TryRemove(key, out var info);
+            Console.WriteLine($"[GetSeasonSearchInfo] Series {seriesId} Season {seasonNumber} - Returning: '{info ?? "(null)"}'");
+            return info;
         }
 
         public async Task<List<DownloadDecision>> EpisodeSearch(int episodeId, bool userInvokedSearch, bool interactiveSearch)
@@ -84,6 +113,12 @@ namespace NzbDrone.Core.IndexerSearch
                 return await SearchAnime(series, episode, false, userInvokedSearch, interactiveSearch);
             }
 
+            if (series.SeriesType == SeriesTypes.Racing)
+            {
+                // Racing series use episode title for search (e.g., "MotoGP 2025 Thailand Race")
+                return await SearchRacing(series, episode, false, userInvokedSearch, interactiveSearch);
+            }
+
             if (episode.SeasonNumber == 0)
             {
                 // Search for special episodes in season 0
@@ -91,6 +126,59 @@ namespace NzbDrone.Core.IndexerSearch
             }
 
             return await SearchSingle(series, episode, false, userInvokedSearch, interactiveSearch);
+        }
+
+        public async Task<List<DownloadDecision>> CustomQuerySearch(int episodeId, string query, bool userInvokedSearch, bool interactiveSearch)
+        {
+            var episode = _episodeService.GetEpisode(episodeId);
+            var series = _seriesService.GetSeries(episode.SeriesId);
+
+            _logger.Info("CustomQuerySearch: Searching for episode {0} with custom query: {1}", episodeId, query);
+
+            var searchSpec = Get<SpecialEpisodeSearchCriteria>(series, new List<Episode> { episode }, false, userInvokedSearch, interactiveSearch);
+
+            // Use the custom query as the search term
+            searchSpec.EpisodeQueryTitles = new[] { query };
+
+            var downloadDecisions = await Dispatch(indexer => indexer.Fetch(searchSpec), searchSpec);
+
+            if (downloadDecisions.Any())
+            {
+                _searchInfos[episode.Id] = $"Custom search results for: {query}";
+            }
+            else
+            {
+                _searchWarnings[episode.Id] = $"No results found for custom query: {query}";
+            }
+
+            return DeDupeDecisions(downloadDecisions);
+        }
+
+        public async Task<List<DownloadDecision>> CustomQuerySeasonSearch(int seriesId, int seasonNumber, string query, bool userInvokedSearch, bool interactiveSearch)
+        {
+            var series = _seriesService.GetSeries(seriesId);
+            var episodes = _episodeService.GetEpisodesBySeason(seriesId, seasonNumber);
+
+            _logger.Info("CustomQuerySeasonSearch: Searching for series {0} season {1} with custom query: {2}", seriesId, seasonNumber, query);
+
+            var searchSpec = Get<SpecialEpisodeSearchCriteria>(series, episodes, false, userInvokedSearch, interactiveSearch);
+
+            // Use the custom query as the search term
+            searchSpec.EpisodeQueryTitles = new[] { query };
+
+            var downloadDecisions = await Dispatch(indexer => indexer.Fetch(searchSpec), searchSpec);
+
+            var key = $"s{seriesId}_{seasonNumber}";
+            if (downloadDecisions.Any())
+            {
+                _seasonSearchInfos[key] = $"Custom search results for: {query}";
+            }
+            else
+            {
+                _seasonSearchInfos[key] = $"No results found for custom query: {query}";
+            }
+
+            return DeDupeDecisions(downloadDecisions);
         }
 
         public async Task<List<DownloadDecision>> SeasonSearch(int seriesId, int seasonNumber, bool missingOnly, bool monitoredOnly, bool userInvokedSearch, bool interactiveSearch)
@@ -122,6 +210,8 @@ namespace NzbDrone.Core.IndexerSearch
             var mappings = GetSceneSeasonMappings(series, episodes);
 
             var downloadDecisions = new List<DownloadDecision>();
+            var successfulQueries = new List<string>();
+            var allAttemptedQueries = new List<string>();
 
             foreach (var mapping in mappings)
             {
@@ -138,7 +228,37 @@ namespace NzbDrone.Core.IndexerSearch
                     searchSpec.SeasonNumber = mapping.SeasonNumber;
                     searchSpec.EpisodeNumber = mapping.EpisodeMapping.EpisodeNumber;
 
+                    // Build accurate query description
+                    var queryParts = new List<string>();
+                    if (series.TvdbId > 0)
+                    {
+                        var idPart = $"tvdbid={series.TvdbId}";
+                        if (series.TvRageId > 0)
+                        {
+                            idPart += $" rid={series.TvRageId}";
+                        }
+                        idPart += $" season={mapping.SeasonNumber} ep={mapping.EpisodeMapping.EpisodeNumber}";
+                        queryParts.Add(idPart);
+                    }
+
+                    if (mapping.SceneTitles.Any())
+                    {
+                        foreach (var title in mapping.SceneTitles)
+                        {
+                            queryParts.Add($"q={title} S{mapping.SeasonNumber:00}E{mapping.EpisodeMapping.EpisodeNumber:00}");
+                        }
+                    }
+
+                    var queryInfo = string.Join(", ", queryParts);
+                    allAttemptedQueries.Add(queryInfo);
+
                     var decisions = await Dispatch(indexer => indexer.Fetch(searchSpec), searchSpec);
+
+                    if (decisions.Any())
+                    {
+                        successfulQueries.Add(queryInfo);
+                    }
+
                     downloadDecisions.AddRange(decisions);
                 }
                 else
@@ -146,9 +266,55 @@ namespace NzbDrone.Core.IndexerSearch
                     var searchSpec = Get<SeasonSearchCriteria>(series, mapping, monitoredOnly, userInvokedSearch, interactiveSearch);
                     searchSpec.SeasonNumber = mapping.SeasonNumber;
 
+                    // Build accurate query description
+                    var queryParts = new List<string>();
+                    if (series.TvdbId > 0)
+                    {
+                        var idPart = $"tvdbid={series.TvdbId}";
+                        if (series.TvRageId > 0)
+                        {
+                            idPart += $" rid={series.TvRageId}";
+                        }
+                        idPart += $" season={mapping.SeasonNumber}";
+                        queryParts.Add(idPart);
+                    }
+
+                    if (mapping.SceneTitles.Any())
+                    {
+                        foreach (var title in mapping.SceneTitles)
+                        {
+                            queryParts.Add($"q={title} Season {mapping.SeasonNumber}");
+                        }
+                    }
+
+                    var queryInfo = string.Join(", ", queryParts);
+                    allAttemptedQueries.Add(queryInfo);
+
                     var decisions = await Dispatch(indexer => indexer.Fetch(searchSpec), searchSpec);
+
+                    if (decisions.Any())
+                    {
+                        successfulQueries.Add(queryInfo);
+                    }
+
                     downloadDecisions.AddRange(decisions);
                 }
+            }
+
+            var key = $"s{seriesId}_{seasonNumber}";
+
+            if (downloadDecisions.Any() && successfulQueries.Any())
+            {
+                var infoMessage = $"Results found using: {string.Join(" | ", successfulQueries.Distinct())}";
+                _seasonSearchInfos[key] = infoMessage;
+                _logger.Info("SeasonSearch: Set info for series {0} season {1}: {2}", seriesId, seasonNumber, infoMessage);
+            }
+            else if (!downloadDecisions.Any() && allAttemptedQueries.Any())
+            {
+                // We attempted queries but got no results
+                var warningMessage = $"No results found. Searched for: {string.Join(" | ", allAttemptedQueries.Distinct())}";
+                _seasonSearchInfos[key] = warningMessage;
+                _logger.Info("SeasonSearch: Set warning for series {0} season {1}: {2}", seriesId, seasonNumber, warningMessage);
             }
 
             return DeDupeDecisions(downloadDecisions);
@@ -316,9 +482,12 @@ namespace NzbDrone.Core.IndexerSearch
 
         private async Task<List<DownloadDecision>> SearchSingle(Series series, Episode episode, bool monitoredOnly, bool userInvokedSearch, bool interactiveSearch)
         {
+            _logger.Info("SearchSingle called for episode {0} (ID: {1})", episode.Title, episode.Id);
             var mappings = GetSceneEpisodeMappings(series, episode);
 
             var downloadDecisions = new List<DownloadDecision>();
+            var successfulQueries = new List<string>();
+            var allAttemptedQueries = new List<string>();
 
             foreach (var mapping in mappings)
             {
@@ -326,8 +495,64 @@ namespace NzbDrone.Core.IndexerSearch
                 searchSpec.SeasonNumber = mapping.SeasonNumber;
                 searchSpec.EpisodeNumber = mapping.EpisodeNumber;
 
+                // Build accurate query description showing ALL parameters
+                var queryParts = new List<string>();
+
+                // Add TVDB/TVRage IDs if available
+                if (series.TvdbId > 0)
+                {
+                    var idPart = $"tvdbid={series.TvdbId}";
+                    if (series.TvRageId > 0)
+                    {
+                        idPart += $" rid={series.TvRageId}";
+                    }
+                    idPart += $" season={mapping.SeasonNumber} ep={mapping.EpisodeNumber}";
+                    queryParts.Add(idPart);
+                }
+
+                // Add text-based queries
+                if (mapping.SceneTitles.Any())
+                {
+                    foreach (var title in mapping.SceneTitles)
+                    {
+                        queryParts.Add($"q={title} S{mapping.SeasonNumber:00}E{mapping.EpisodeNumber:00}");
+                    }
+                }
+                else
+                {
+                    queryParts.Add($"S{mapping.SeasonNumber:00}E{mapping.EpisodeNumber:00}");
+                }
+
+                var queryInfo = string.Join(", ", queryParts);
+                allAttemptedQueries.Add(queryInfo);
+
                 var decisions = await Dispatch(indexer => indexer.Fetch(searchSpec), searchSpec);
+                _logger.Info("SearchSingle: S{0:00}E{1:00} returned {2} decisions", mapping.SeasonNumber, mapping.EpisodeNumber, decisions.Count);
+
+                if (decisions.Any())
+                {
+                    successfulQueries.Add(queryInfo);
+                    _logger.Info("SearchSingle: Added successful query: {0}", queryInfo);
+                }
+
                 downloadDecisions.AddRange(decisions);
+            }
+
+            if (downloadDecisions.Any() && successfulQueries.Any())
+            {
+                var infoMessage = $"Results found using: {string.Join(" | ", successfulQueries.Distinct())}";
+                _searchInfos[episode.Id] = infoMessage;
+                _logger.Info("SearchSingle: Set info for episode {0}: {1}", episode.Id, infoMessage);
+            }
+            else if (!downloadDecisions.Any() && allAttemptedQueries.Any())
+            {
+                var warningMessage = $"No results found. Searched for: {string.Join(" | ", allAttemptedQueries.Distinct())}";
+                _searchWarnings[episode.Id] = warningMessage;
+                _logger.Info("SearchSingle: Set warning for episode {0}: {1}", episode.Id, warningMessage);
+            }
+            else
+            {
+                _logger.Info("SearchSingle: No info/warning set - decisions: {0}, queries: {1}", downloadDecisions.Count, successfulQueries.Count);
             }
 
             return DeDupeDecisions(downloadDecisions);
@@ -339,7 +564,20 @@ namespace NzbDrone.Core.IndexerSearch
             var searchSpec = Get<DailyEpisodeSearchCriteria>(series, new List<Episode> { episode }, monitoredOnly, userInvokedSearch, interactiveSearch);
             searchSpec.AirDate = airDate;
 
+            var dateFormat = airDate.ToString("yyyy.MM.dd");
+            var sceneTitles = searchSpec.CleanSceneTitles.Any() ? $"{string.Join(", ", searchSpec.CleanSceneTitles)} " : "";
+            var queryInfo = $"{sceneTitles}{dateFormat}";
+
             var downloadDecisions = await Dispatch(indexer => indexer.Fetch(searchSpec), searchSpec);
+
+            if (downloadDecisions.Any())
+            {
+                _searchInfos[episode.Id] = $"Results found using: {queryInfo}";
+            }
+            else
+            {
+                _searchWarnings[episode.Id] = $"No results found. Searched for: {queryInfo}";
+            }
 
             return DeDupeDecisions(downloadDecisions);
         }
@@ -354,7 +592,22 @@ namespace NzbDrone.Core.IndexerSearch
             searchSpec.EpisodeNumber = episode.SceneEpisodeNumber ?? episode.EpisodeNumber;
             searchSpec.AbsoluteEpisodeNumber = episode.SceneAbsoluteEpisodeNumber ?? episode.AbsoluteEpisodeNumber ?? 0;
 
+            var sceneTitles = searchSpec.CleanSceneTitles.Any() ? $"{string.Join(", ", searchSpec.CleanSceneTitles)} " : "";
+            var episodeInfo = searchSpec.AbsoluteEpisodeNumber > 0
+                ? $"Episode {searchSpec.AbsoluteEpisodeNumber}"
+                : $"S{searchSpec.SeasonNumber:00}E{searchSpec.EpisodeNumber:00}";
+            var queryInfo = $"{sceneTitles}{episodeInfo}";
+
             var downloadDecisions = await Dispatch(indexer => indexer.Fetch(searchSpec), searchSpec);
+
+            if (downloadDecisions.Any())
+            {
+                _searchInfos[episode.Id] = $"Results found using: {queryInfo}";
+            }
+            else
+            {
+                _searchWarnings[episode.Id] = $"No results found. Searched for: {queryInfo}";
+            }
 
             return DeDupeDecisions(downloadDecisions);
         }
@@ -372,7 +625,17 @@ namespace NzbDrone.Core.IndexerSearch
                                                     .Distinct(StringComparer.InvariantCultureIgnoreCase)
                                                     .ToArray();
 
-            downloadDecisions.AddRange(await Dispatch(indexer => indexer.Fetch(searchSpec), searchSpec));
+            var titleSearchDecisions = await Dispatch(indexer => indexer.Fetch(searchSpec), searchSpec);
+            downloadDecisions.AddRange(titleSearchDecisions);
+
+            // Set info for episodes if title search found results
+            if (titleSearchDecisions.Any() && searchSpec.EpisodeQueryTitles.Any())
+            {
+                foreach (var episode in episodes)
+                {
+                    _searchInfos[episode.Id] = $"Results found using: {string.Join(", ", searchSpec.EpisodeQueryTitles.Take(3))}";
+                }
+            }
 
             // Search for each episode by season/episode number as well
             foreach (var episode in episodes)
@@ -387,6 +650,328 @@ namespace NzbDrone.Core.IndexerSearch
             }
 
             return DeDupeDecisions(downloadDecisions);
+        }
+
+        private async Task<List<DownloadDecision>> SearchRacing(Series series, Episode episode, bool monitoredOnly, bool userInvokedSearch, bool interactiveSearch)
+        {
+            var downloadDecisions = new List<DownloadDecision>();
+
+            var searchSpec = Get<SpecialEpisodeSearchCriteria>(series, new List<Episode> { episode }, monitoredOnly, userInvokedSearch, interactiveSearch);
+
+            // Parse episode title to extract GP name and session type
+            var episodeTitle = episode.Title ?? string.Empty;
+            var gpName = ExtractRacingGpName(episodeTitle);
+            var sessionType = ExtractRacingSessionTypeForSearch(episodeTitle);
+            var year = episode.SeasonNumber;
+
+            if (string.IsNullOrWhiteSpace(gpName))
+            {
+                _logger.Warn("Could not extract GP name from racing episode title: {0}", episodeTitle);
+                return downloadDecisions;
+            }
+
+            // Use top 2-3 most common scene titles to reduce query count
+            var topSceneTitles = searchSpec.CleanSceneTitles.Take(3).ToList();
+
+            // Tier 1: Search with session type (strict - most relevant)
+            // Only if we successfully detected a session type
+            if (!string.IsNullOrWhiteSpace(sessionType))
+            {
+                var strictQueries = topSceneTitles
+                    .Select(sceneTitle => $"{sceneTitle} {year} {gpName} {sessionType}")
+                    .ToArray();
+
+                searchSpec.EpisodeQueryTitles = strictQueries;
+
+                _logger.Info("Racing search Tier 1 (strict) for {0} S{1}E{2} '{3}' using queries: {4}",
+                    series.Title, episode.SeasonNumber, episode.EpisodeNumber, episodeTitle,
+                    string.Join(", ", searchSpec.EpisodeQueryTitles));
+
+                downloadDecisions.AddRange(await Dispatch(indexer => indexer.Fetch(searchSpec), searchSpec));
+
+                // If we got results, return them (don't search broader)
+                if (downloadDecisions.Any())
+                {
+                    _logger.Info("Racing search found {0} results in Tier 1 (strict)", downloadDecisions.Count);
+                    _searchInfos[episode.Id] = $"Results found using: {string.Join(", ", strictQueries)}";
+                    return DeDupeDecisions(downloadDecisions);
+                }
+
+                _logger.Info("Racing search Tier 1 returned no results, trying Tier 2 (broader)");
+            }
+            else
+            {
+                // Session type could not be detected - skip Tier 1, go straight to broad search
+                _logger.Warn("Could not detect session type from episode title '{0}' - using broad search", episodeTitle);
+                _logger.Error("===== SETTING WARNING NOW ===== Episode: {0}, ID: {1}", episodeTitle, episode.Id);
+
+                // Set warning for UI display
+                var warning = $"Session type could not be detected from episode title '{episodeTitle}'. Showing all sessions for this event.";
+                _searchWarnings[episode.Id] = warning;
+                _logger.Info("SEARCH: Set warning for episode {0}: {1}", episode.Id, warning);
+            }
+
+            // Tier 2: Search without session type (broader - fallback)
+            var broadQueries = topSceneTitles
+                .Select(sceneTitle => $"{sceneTitle} {year} {gpName}")
+                .ToArray();
+
+            searchSpec.EpisodeQueryTitles = broadQueries;
+
+            var tierLabel = string.IsNullOrWhiteSpace(sessionType) ? "broad (no session detected)" : "broader";
+            _logger.Info("Racing search Tier 2 ({0}) for {1} S{2}E{3} '{4}' using queries: {5}",
+                tierLabel, series.Title, episode.SeasonNumber, episode.EpisodeNumber, episodeTitle,
+                string.Join(", ", searchSpec.EpisodeQueryTitles));
+
+            downloadDecisions.AddRange(await Dispatch(indexer => indexer.Fetch(searchSpec), searchSpec));
+
+            if (downloadDecisions.Any())
+            {
+                _logger.Info("Racing search found {0} results in Tier 2 ({1})", downloadDecisions.Count, tierLabel);
+                _searchInfos[episode.Id] = $"Results found using: {string.Join(", ", broadQueries)}";
+                return DeDupeDecisions(downloadDecisions);
+            }
+
+            _logger.Info("Racing search Tier 2 returned no results, trying Tier 3 (round-based)");
+
+            // Tier 3: Search by round number (for older seasons with inconsistent TVDB naming)
+            // Use episode number as round number
+            var roundNumber = episode.EpisodeNumber;
+            var roundQueries = topSceneTitles
+                .SelectMany(sceneTitle => new[]
+                {
+                    $"{sceneTitle} {year} Round{roundNumber}",      // "MotoGP 2008 Round18"
+                    $"{sceneTitle} {year} Round {roundNumber}"      // "MotoGP 2008 Round 18"
+                })
+                .ToArray();
+
+            searchSpec.EpisodeQueryTitles = roundQueries;
+
+            _logger.Info("Racing search Tier 3 (round-based) for {0} S{1}E{2} '{3}' using queries: {4}",
+                series.Title, episode.SeasonNumber, episode.EpisodeNumber, episodeTitle,
+                string.Join(", ", searchSpec.EpisodeQueryTitles));
+
+            downloadDecisions.AddRange(await Dispatch(indexer => indexer.Fetch(searchSpec), searchSpec));
+
+            if (downloadDecisions.Any())
+            {
+                _logger.Info("Racing search found {0} results in Tier 3 (round-based)", downloadDecisions.Count);
+                _searchInfos[episode.Id] = $"Results found using: {string.Join(", ", roundQueries)}";
+            }
+            else
+            {
+                _logger.Warn("Racing search found no results in any tier for: {0}", episodeTitle);
+            }
+
+            _searchWarnings.TryGetValue(episode.Id, out var debugWarning);
+            _searchInfos.TryGetValue(episode.Id, out var debugInfo);
+            Console.WriteLine($"[SearchRacing] Before return - Episode {episode.Id} - Warning: '{debugWarning ?? "(null)"}', Info: '{debugInfo ?? "(null)"}', Thread: {System.Threading.Thread.CurrentThread.ManagedThreadId}");
+            return DeDupeDecisions(downloadDecisions);
+        }
+
+        private string ExtractRacingGpName(string episodeTitle)
+        {
+            if (string.IsNullOrWhiteSpace(episodeTitle))
+            {
+                return null;
+            }
+
+            // TVDB formats vary by year/series:
+            // 2015-2020: "R1 - Qatar (Free Practice 1)" or "R2 - Spain (Race)"
+            // 2020 F1: "Austria (Practice 1)"
+            // 2024 F1: "Round 1: Bahrain (Practice 1)"
+            // 2024 MotoGP: "Qatar Airways Grand Prix of Qatar MotoGP Free Practice Nr. 1"
+            // 2025 MotoGP: "THAILAND - Chang - FP 1"
+
+            // Pattern 1: "Rxx - GPName" or "Round xx: GPName"
+            var roundMatch = System.Text.RegularExpressions.Regex.Match(
+                episodeTitle,
+                @"^R(?:ound)?\s*\d+\s*[-:]\s*([^(]+)",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+            if (roundMatch.Success)
+            {
+                var gpPart = roundMatch.Groups[1].Value.Trim();
+                var parenIndex = gpPart.IndexOf('(');
+                if (parenIndex > 0)
+                {
+                    gpPart = gpPart.Substring(0, parenIndex).Trim();
+                }
+
+                return gpPart;
+            }
+
+            // Pattern 2: "Grand Prix of GPNAME" (2024 sponsor format)
+            var gpOfMatch = System.Text.RegularExpressions.Regex.Match(
+                episodeTitle,
+                @"Grand\s+Prix\s+of\s+(\w+)",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+            if (gpOfMatch.Success)
+            {
+                return gpOfMatch.Groups[1].Value;
+            }
+
+            // Pattern 2b: "LOCATION Grand Prix" - F1 2025 format like "Las Vegas Grand Prix 2025"
+            var locationGpMatch = System.Text.RegularExpressions.Regex.Match(
+                episodeTitle,
+                @"([A-Z][a-zA-Z\s]+?)\s+Grand\s+Prix",
+                System.Text.RegularExpressions.RegexOptions.None);
+
+            if (locationGpMatch.Success)
+            {
+                // Extract just the location, removing sponsor names
+                var location = locationGpMatch.Groups[1].Value.Trim();
+                // Take only the last 1-3 words (the actual location, not sponsors)
+                var words = location.Split(' ');
+                if (words.Length > 3)
+                {
+                    location = string.Join(" ", words.Skip(words.Length - 2));
+                }
+                return location;
+            }
+
+            // Pattern 3: "GPName (Session)" - simple format with parens
+            var simpleMatch = System.Text.RegularExpressions.Regex.Match(
+                episodeTitle,
+                @"^([^(]+?)\s*\(",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+            if (simpleMatch.Success)
+            {
+                return simpleMatch.Groups[1].Value.Trim();
+            }
+
+            // Pattern 4: "GPName - Circuit - Session" (dash-separated)
+            var parts = episodeTitle.Split(new[] { " - " }, StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length >= 1)
+            {
+                return parts[0].Trim();
+            }
+
+            return null;
+        }
+
+        private string ExtractRacingSessionTypeForSearch(string episodeTitle)
+        {
+            if (string.IsNullOrWhiteSpace(episodeTitle))
+            {
+                return null;
+            }
+
+            var titleLower = episodeTitle.ToLowerInvariant();
+
+            // Check for specific session types
+            if (titleLower.Contains("sprint"))
+            {
+                return "Sprint";
+            }
+
+            // Qualifying formats: "Qualifying", "Quali", "Q 1", "Q 2", "Q1", "Q2"
+            if (titleLower.Contains("qualifying") || titleLower.Contains("quali") ||
+                System.Text.RegularExpressions.Regex.IsMatch(titleLower, @"\bq\s*[12]\b"))
+            {
+                return "Qualifying";
+            }
+
+            if (titleLower.Contains("superpole race"))
+            {
+                return "Superpole Race";
+            }
+
+            if (titleLower.Contains("superpole"))
+            {
+                return "Superpole";
+            }
+
+            if (System.Text.RegularExpressions.Regex.IsMatch(titleLower, @"\brace\s*[12]\b"))
+            {
+                var match = System.Text.RegularExpressions.Regex.Match(titleLower, @"\brace\s*([12])\b");
+                return $"Race {match.Groups[1].Value}";
+            }
+
+            // "Race" but not inside "Free Practice" or similar
+            if (System.Text.RegularExpressions.Regex.IsMatch(titleLower, @"\b(?<!free\s)(?<!practice\s)race\b"))
+            {
+                return "Race";
+            }
+
+            // FP patterns: "FP1", "Free Practice 1", "Free Practice Nr. 1", "Practice 1"
+            var fpMatch = System.Text.RegularExpressions.Regex.Match(titleLower, @"\b(?:free\s+)?practice\s*(?:nr\.?\s*)?([1-4])\b");
+            if (fpMatch.Success)
+            {
+                return $"FP{fpMatch.Groups[1].Value}";
+            }
+
+            if (System.Text.RegularExpressions.Regex.IsMatch(titleLower, @"\bfp[1-4]\b"))
+            {
+                var match = System.Text.RegularExpressions.Regex.Match(titleLower, @"\b(fp[1-4])\b");
+                return match.Groups[1].Value.ToUpperInvariant();
+            }
+
+            // For search: Return null if no session detected (don't assume Race!)
+            return null;
+        }
+
+        private string ExtractRacingSessionType(string episodeTitle)
+        {
+            if (string.IsNullOrWhiteSpace(episodeTitle))
+            {
+                return null;
+            }
+
+            var titleLower = episodeTitle.ToLowerInvariant();
+
+            // Check for specific session types
+            if (titleLower.Contains("sprint"))
+            {
+                return "Sprint";
+            }
+
+            // Qualifying formats: "Qualifying", "Quali", "Q 1", "Q 2", "Q1", "Q2"
+            if (titleLower.Contains("qualifying") || titleLower.Contains("quali") ||
+                System.Text.RegularExpressions.Regex.IsMatch(titleLower, @"\bq\s*[12]\b"))
+            {
+                return "Qualifying";
+            }
+
+            if (titleLower.Contains("superpole race"))
+            {
+                return "Superpole Race";
+            }
+
+            if (titleLower.Contains("superpole"))
+            {
+                return "Superpole";
+            }
+
+            if (System.Text.RegularExpressions.Regex.IsMatch(titleLower, @"\brace\s*[12]\b"))
+            {
+                var match = System.Text.RegularExpressions.Regex.Match(titleLower, @"\brace\s*([12])\b");
+                return $"Race {match.Groups[1].Value}";
+            }
+
+            // "Race" but not inside "Free Practice" or similar
+            if (System.Text.RegularExpressions.Regex.IsMatch(titleLower, @"\b(?<!free\s)(?<!practice\s)race\b"))
+            {
+                return "Race";
+            }
+
+            // FP patterns: "FP1", "Free Practice 1", "Free Practice Nr. 1", "Practice 1"
+            var fpMatch = System.Text.RegularExpressions.Regex.Match(titleLower, @"\b(?:free\s+)?practice\s*(?:nr\.?\s*)?([1-4])\b");
+            if (fpMatch.Success)
+            {
+                return $"FP{fpMatch.Groups[1].Value}";
+            }
+
+            if (System.Text.RegularExpressions.Regex.IsMatch(titleLower, @"\bfp[1-4]\b"))
+            {
+                var match = System.Text.RegularExpressions.Regex.Match(titleLower, @"\b(fp[1-4])\b");
+                return match.Groups[1].Value.ToUpperInvariant();
+            }
+
+            // Default to Race if no session type found
+            return "Race";
         }
 
         private async Task<List<DownloadDecision>> SearchAnimeSeason(Series series, List<Episode> episodes, bool monitoredOnly, bool userInvokedSearch, bool interactiveSearch)

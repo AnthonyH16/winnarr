@@ -20,6 +20,11 @@ function SeriesTypePopoverContent() {
         title={translate('Standard')}
         data={translate('StandardEpisodeTypeDescription')}
       />
+
+      <DescriptionListItem
+        title={translate('Racing')}
+        data={translate('RacingEpisodeTypeDescription')}
+      />
     </DescriptionList>
   );
 }

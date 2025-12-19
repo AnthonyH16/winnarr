@@ -47,6 +47,13 @@ const seriesTypeOptions: ISeriesTypeOption[] = [
       return translate('AnimeEpisodeTypeFormat', { format: '005' });
     },
   },
+  {
+    key: seriesTypes.RACING,
+    value: 'Racing',
+    get format() {
+      return translate('RacingEpisodeTypeFormat', { format: 'Monaco.Qualifying' });
+    },
+  },
 ];
 
 function SeriesTypeSelectInput(props: SeriesTypeSelectInputProps) {

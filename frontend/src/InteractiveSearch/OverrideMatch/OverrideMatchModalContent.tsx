@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useDispatch, useSelector } from 'react-redux';
+import AppState from 'App/State/AppState';
 import DescriptionList from 'Components/DescriptionList/DescriptionList';
 import DescriptionListItem from 'Components/DescriptionList/DescriptionListItem';
 import Button from 'Components/Link/Button';
@@ -18,6 +19,7 @@ import SelectLanguageModal from 'InteractiveImport/Language/SelectLanguageModal'
 import SelectQualityModal from 'InteractiveImport/Quality/SelectQualityModal';
 import SelectSeasonModal from 'InteractiveImport/Season/SelectSeasonModal';
 import SelectSeriesModal from 'InteractiveImport/Series/SelectSeriesModal';
+import InteractiveSearchPayload from 'InteractiveSearch/InteractiveSearchPayload';
 import Language from 'Language/Language';
 import { QualityModel } from 'Quality/Quality';
 import Series from 'Series/Series';
@@ -52,6 +54,7 @@ interface OverrideMatchModalContentProps {
   protocol: DownloadProtocol;
   isGrabbing: boolean;
   grabError?: string;
+  searchPayload?: InteractiveSearchPayload;
   onModalClose(): void;
 }
 
@@ -64,12 +67,55 @@ function OverrideMatchModalContent(props: OverrideMatchModalContentProps) {
     protocol,
     isGrabbing,
     grabError,
+    searchPayload,
     onModalClose,
   } = props;
 
-  const [seriesId, setSeriesId] = useState(props.seriesId);
-  const [seasonNumber, setSeasonNumber] = useState(props.seasonNumber);
-  const [episodes, setEpisodes] = useState(props.episodes);
+  // Check if we have an episodeId from Interactive Search (episode-level search)
+  const searchedEpisodeId =
+    searchPayload && 'episodeId' in searchPayload
+      ? searchPayload.episodeId
+      : undefined;
+
+  // Get the searched episode from Redux state if available
+  const searchedEpisode = useSelector((state: AppState) => {
+    if (!searchedEpisodeId) {
+      return undefined;
+    }
+
+    // Look through all series to find the episode
+    for (const s of state.series.items) {
+      const episode = state.episodes.items.find(
+        (e) => e.id === searchedEpisodeId && e.seriesId === s.id
+      );
+      if (episode) {
+        return {
+          seriesId: s.id,
+          seasonNumber: episode.seasonNumber,
+          episode: {
+            id: episode.id,
+            episodeFileId: episode.episodeFileId ?? 0,
+            seasonNumber: episode.seasonNumber,
+            episodeNumber: episode.episodeNumber,
+            absoluteEpisodeNumber: episode.absoluteEpisodeNumber,
+            title: episode.title,
+          } as ReleaseEpisode,
+        };
+      }
+    }
+    return undefined;
+  });
+
+  // Use searched episode info as default if available, otherwise fall back to parser result
+  const [seriesId, setSeriesId] = useState(
+    searchedEpisode?.seriesId ?? props.seriesId
+  );
+  const [seasonNumber, setSeasonNumber] = useState(
+    searchedEpisode?.seasonNumber ?? props.seasonNumber
+  );
+  const [episodes, setEpisodes] = useState(
+    searchedEpisode?.episode ? [searchedEpisode.episode] : props.episodes
+  );
   const [languages, setLanguages] = useState(props.languages);
   const [quality, setQuality] = useState(props.quality);
   const [downloadClientId, setDownloadClientId] = useState<number | null>(null);

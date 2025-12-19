@@ -2,6 +2,7 @@ import classNames from 'classnames';
 import React, {
   ChangeEvent,
   FocusEvent,
+  KeyboardEvent,
   SyntheticEvent,
   useCallback,
   useEffect,
@@ -26,6 +27,7 @@ export interface CommonTextInputProps {
   onFocus?: (event: FocusEvent<HTMLInputElement, Element>) => void;
   onBlur?: (event: SyntheticEvent) => void;
   onCopy?: (event: SyntheticEvent) => void;
+  onKeyDown?: (event: KeyboardEvent<HTMLInputElement>) => void;
   onSelectionChange?: (start: number | null, end: number | null) => void;
 }
 
@@ -56,6 +58,7 @@ function TextInput({
   onBlur,
   onFocus,
   onCopy,
+  onKeyDown,
   onChange,
   onSelectionChange,
 }: TextInputProps | FileInputProps): JSX.Element {
@@ -174,6 +177,7 @@ function TextInput({
       onBlur={onBlur}
       onCopy={onCopy}
       onCut={onCopy}
+      onKeyDown={onKeyDown}
       onKeyUp={handleKeyUp}
       onMouseDown={handleMouseDown}
       onMouseUp={handleMouseUp}

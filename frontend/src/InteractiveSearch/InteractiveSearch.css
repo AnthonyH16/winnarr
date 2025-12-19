@@ -1,7 +1,31 @@
+.searchContainer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 10px;
+  gap: 10px;
+}
+
+.customSearchContainer {
+  display: flex;
+  flex: 1;
+  gap: 10px;
+  align-items: center;
+}
+
+.searchInput {
+  composes: text from '~Components/Form/TextInput.css';
+  flex: 1;
+}
+
+.searchButton {
+  composes: button from '~Components/Link/Button.css';
+  white-space: nowrap;
+}
+
 .filterMenuContainer {
   display: flex;
   justify-content: flex-end;
-  margin-bottom: 10px;
 }
 
 .filteredMessage {

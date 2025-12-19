@@ -1,0 +1,29 @@
+FROM mcr.microsoft.com/dotnet/aspnet:8.0
+
+# Set up environment
+ENV SONARR_BRANCH=develop
+ENV XDG_CONFIG_HOME=/config
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    libicu-dev \
+    sqlite3 \
+    mediainfo \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create user and directories
+RUN groupadd -g 1000 sonarr && \
+    useradd -u 1000 -g sonarr -m sonarr && \
+    mkdir -p /app/sonarr/bin /config && \
+    chown -R sonarr:sonarr /app /config
+
+# Copy built Sonarr (backend and frontend)
+COPY --chown=sonarr:sonarr _output/net8.0/ /app/sonarr/bin/
+COPY --chown=sonarr:sonarr _output/UI/ /app/sonarr/bin/UI/
+
+WORKDIR /app/sonarr/bin
+USER sonarr
+
+EXPOSE 8989
+
+ENTRYPOINT ["dotnet", "/app/sonarr/bin/Sonarr.dll", "-nobrowser", "-data=/config"]

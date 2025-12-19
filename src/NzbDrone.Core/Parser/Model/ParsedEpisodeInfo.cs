@@ -32,6 +32,12 @@ namespace NzbDrone.Core.Parser.Model
         public string ReleaseTokens { get; set; }
         public int? DailyPart { get; set; }
 
+        // Racing content fields
+        public bool IsRacingContent { get; set; }
+        public string RacingGpName { get; set; }
+        public string RacingSessionType { get; set; }
+        public string RacingClass { get; set; }
+
         public ParsedEpisodeInfo()
         {
             EpisodeNumbers = Array.Empty<int>();

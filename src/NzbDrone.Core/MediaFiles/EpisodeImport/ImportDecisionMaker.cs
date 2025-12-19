@@ -131,6 +131,24 @@ namespace NzbDrone.Core.MediaFiles.EpisodeImport
 
                 _aggregationService.Augment(localEpisode, downloadClientItem);
 
+                // For Interactive Search grabs, override the parser's episode match with the
+                // episodes from TrackedDownload. The user explicitly selected which episode to
+                // download for, so we must trust that over the parser (which can be wrong for
+                // ambiguous titles like racing content with sponsor names in episode titles).
+                if (downloadClientItem?.DownloadId.IsNotNullOrWhiteSpace() == true)
+                {
+                    var trackedDownload = _trackedDownloadService.Find(downloadClientItem.DownloadId);
+
+                    if (trackedDownload?.RemoteEpisode != null &&
+                        trackedDownload.RemoteEpisode.ReleaseSource == ReleaseSourceType.InteractiveSearch &&
+                        trackedDownload.RemoteEpisode.Episodes.Any())
+                    {
+                        _logger.Info("Interactive Search grab detected, using episodes from TrackedDownload: {0}",
+                            string.Join(", ", trackedDownload.RemoteEpisode.Episodes.Select(e => $"S{e.SeasonNumber:00}E{e.EpisodeNumber:00}")));
+                        localEpisode.Episodes = trackedDownload.RemoteEpisode.Episodes;
+                    }
+                }
+
                 if (localEpisode.Episodes.Empty())
                 {
                     if (IsPartialSeason(localEpisode))

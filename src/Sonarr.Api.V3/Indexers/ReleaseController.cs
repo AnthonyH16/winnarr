@@ -60,6 +60,8 @@ namespace Sonarr.Api.V3.Indexers
             _parsingService = parsingService;
             _logger = logger;
 
+            _logger.Info("ReleaseController initialized - VERSION 2025-11-26-A");
+
             PostValidator.RuleFor(s => s.IndexerId).ValidId();
             PostValidator.RuleFor(s => s.Guid).NotEmpty();
 
@@ -70,6 +72,13 @@ namespace Sonarr.Api.V3.Indexers
         [Consumes("application/json")]
         public async Task<object> DownloadRelease([FromBody] ReleaseResource release)
         {
+            _logger.Info("DownloadRelease called: EpisodeId={0}, EpisodeIds={1}, SeriesId={2}, ShouldOverride={3}, Guid={4}",
+                release.EpisodeId?.ToString() ?? "null",
+                release.EpisodeIds != null ? string.Join(",", release.EpisodeIds) : "null",
+                release.SeriesId?.ToString() ?? "null",
+                release.ShouldOverride?.ToString() ?? "null",
+                release.Guid ?? "null");
+
             var remoteEpisode = _remoteEpisodeCache.Find(GetCacheKey(release));
 
             if (remoteEpisode == null)
@@ -111,16 +120,20 @@ namespace Sonarr.Api.V3.Indexers
                     remoteEpisode.Languages = release.Languages;
                 }
 
-                if (remoteEpisode.Series == null)
+                // CRITICAL: When release.EpisodeId is provided (from Interactive Search), ALWAYS use it
+                // to override whatever episodes the parser found. This ensures the user's explicit
+                // episode selection is respected, even if the parser matched a different episode
+                // (e.g., racing content where "Qatar" in the title matches multiple GPs due to sponsor names)
+                if (release.EpisodeId.HasValue)
                 {
-                    if (release.EpisodeId.HasValue)
-                    {
-                        var episode = _episodeService.GetEpisode(release.EpisodeId.Value);
-
-                        remoteEpisode.Series = _seriesService.GetSeries(episode.SeriesId);
-                        remoteEpisode.Episodes = new List<Episode> { episode };
-                    }
-                    else if (release.SeriesId.HasValue)
+                    var episode = _episodeService.GetEpisode(release.EpisodeId.Value);
+                    remoteEpisode.Series = _seriesService.GetSeries(episode.SeriesId);
+                    remoteEpisode.Episodes = new List<Episode> { episode };
+                    _logger.Info("Using episode from Interactive Search (override): {0} - {1}", episode.Id, episode.Title);
+                }
+                else if (remoteEpisode.Series == null)
+                {
+                    if (release.SeriesId.HasValue)
                     {
                         var series = _seriesService.GetSeries(release.SeriesId.Value);
                         var episodes = _parsingService.GetEpisodes(remoteEpisode.ParsedEpisodeInfo, series, true);
@@ -140,13 +153,21 @@ namespace Sonarr.Api.V3.Indexers
                 }
                 else if (remoteEpisode.Episodes.Empty())
                 {
-                    var episodes = _parsingService.GetEpisodes(remoteEpisode.ParsedEpisodeInfo, remoteEpisode.Series, true);
+                    List<Episode> episodes;
 
-                    if (episodes.Empty() && release.EpisodeId.HasValue)
+                    // When release.EpisodeId is provided (from Interactive Search), prioritize it
+                    // over parser results. This ensures the user's explicit episode selection is
+                    // respected, even if the parser matches a different episode (e.g., racing content
+                    // where "Qatar" in the title matches multiple GPs due to sponsor names)
+                    if (release.EpisodeId.HasValue)
                     {
                         var episode = _episodeService.GetEpisode(release.EpisodeId.Value);
-
                         episodes = new List<Episode> { episode };
+                        _logger.Info("Using episode from Interactive Search: {0} - {1}", episode.Id, episode.Title);
+                    }
+                    else
+                    {
+                        episodes = _parsingService.GetEpisodes(remoteEpisode.ParsedEpisodeInfo, remoteEpisode.Series, true);
                     }
 
                     remoteEpisode.Episodes = episodes;
@@ -170,27 +191,61 @@ namespace Sonarr.Api.V3.Indexers
 
         [HttpGet]
         [Produces("application/json")]
-        public async Task<List<ReleaseResource>> GetReleases(int? seriesId, int? episodeId, int? seasonNumber)
+        public async Task<List<ReleaseResource>> GetReleases(int? seriesId, int? episodeId, int? seasonNumber, string query = null)
         {
             if (episodeId.HasValue)
             {
-                return await GetEpisodeReleases(episodeId.Value);
+                return await GetEpisodeReleases(episodeId.Value, query);
             }
 
             if (seriesId.HasValue && seasonNumber.HasValue)
             {
-                return await GetSeasonReleases(seriesId.Value, seasonNumber.Value);
+                return await GetSeasonReleases(seriesId.Value, seasonNumber.Value, query);
             }
 
             return await GetRss();
         }
 
-        private async Task<List<ReleaseResource>> GetEpisodeReleases(int episodeId)
+        private async Task<List<ReleaseResource>> GetEpisodeReleases(int episodeId, string customQuery = null)
         {
+            _logger.Info("API: GetEpisodeReleases called for episodeId={0}, customQuery={1}", episodeId, customQuery ?? "(null)");
             try
             {
-                var decisions = await _releaseSearchService.EpisodeSearch(episodeId, true, true);
+                List<DownloadDecision> decisions;
+
+                if (!string.IsNullOrWhiteSpace(customQuery))
+                {
+                    // Use custom query search
+                    decisions = await _releaseSearchService.CustomQuerySearch(episodeId, customQuery, true, true);
+                    _logger.Info("API: CustomQuerySearch returned {0} decisions", decisions.Count);
+                }
+                else
+                {
+                    // Use standard episode search
+                    decisions = await _releaseSearchService.EpisodeSearch(episodeId, true, true);
+                    _logger.Info("API: EpisodeSearch returned {0} decisions", decisions.Count);
+                }
+
                 var prioritizedDecisions = _prioritizeDownloadDecision.PrioritizeDecisions(decisions);
+                _logger.Info("API: PrioritizeDecisions returned {0} prioritized decisions", prioritizedDecisions.Count);
+
+                // Check if there's a search warning (e.g., racing session type not detected)
+                var searchWarning = NzbDrone.Core.IndexerSearch.ReleaseSearchService.GetSearchWarning(episodeId);
+                _logger.Info("API: GetSearchWarning({0}) returned: '{1}'", episodeId, searchWarning ?? "(null)");
+                if (!string.IsNullOrWhiteSpace(searchWarning))
+                {
+                    _logger.Info("API: Adding X-Search-Warning header: {0}", searchWarning);
+                    Response.Headers.Add("X-Search-Warning", searchWarning);
+                }
+
+                // Check if there's search info (e.g., successful query terms)
+                var searchInfo = NzbDrone.Core.IndexerSearch.ReleaseSearchService.GetSearchInfo(episodeId);
+                _logger.Info("API: GetSearchInfo({0}) returned: '{1}'", episodeId, searchInfo ?? "(null)");
+                if (!string.IsNullOrWhiteSpace(searchInfo))
+                {
+                    _logger.Info("API: Adding X-Search-Info header: {0}", searchInfo);
+                    Response.Headers.Add("X-Search-Info", searchInfo);
+                }
 
                 return MapDecisions(prioritizedDecisions);
             }
@@ -205,12 +260,37 @@ namespace Sonarr.Api.V3.Indexers
             }
         }
 
-        private async Task<List<ReleaseResource>> GetSeasonReleases(int seriesId, int seasonNumber)
+        private async Task<List<ReleaseResource>> GetSeasonReleases(int seriesId, int seasonNumber, string customQuery = null)
         {
+            _logger.Info("API: GetSeasonReleases called for seriesId={0}, seasonNumber={1}, customQuery={2}", seriesId, seasonNumber, customQuery ?? "(null)");
             try
             {
-                var decisions = await _releaseSearchService.SeasonSearch(seriesId, seasonNumber, false, false, true, true);
+                List<DownloadDecision> decisions;
+
+                if (!string.IsNullOrWhiteSpace(customQuery))
+                {
+                    // Use custom query search for the season
+                    decisions = await _releaseSearchService.CustomQuerySeasonSearch(seriesId, seasonNumber, customQuery, true, true);
+                    _logger.Info("API: CustomQuerySeasonSearch returned {0} decisions", decisions.Count);
+                }
+                else
+                {
+                    // Use standard season search
+                    decisions = await _releaseSearchService.SeasonSearch(seriesId, seasonNumber, false, false, true, true);
+                    _logger.Info("API: SeasonSearch returned {0} decisions", decisions.Count);
+                }
+
                 var prioritizedDecisions = _prioritizeDownloadDecision.PrioritizeDecisions(decisions);
+                _logger.Info("API: PrioritizeDecisions returned {0} prioritized decisions", prioritizedDecisions.Count);
+
+                // Check if there's search info for season search
+                var searchInfo = NzbDrone.Core.IndexerSearch.ReleaseSearchService.GetSeasonSearchInfo(seriesId, seasonNumber);
+                _logger.Info("API: GetSeasonSearchInfo({0}, {1}) returned: '{2}'", seriesId, seasonNumber, searchInfo ?? "(null)");
+                if (!string.IsNullOrWhiteSpace(searchInfo))
+                {
+                    _logger.Info("API: Adding X-Search-Info header: {0}", searchInfo);
+                    Response.Headers.Add("X-Search-Info", searchInfo);
+                }
 
                 return MapDecisions(prioritizedDecisions);
             }

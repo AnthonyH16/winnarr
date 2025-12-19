@@ -1,10 +1,12 @@
-import React, { useCallback, useEffect } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { useDispatch, useSelector } from 'react-redux';
 import ClientSideCollectionAppState from 'App/State/ClientSideCollectionAppState';
 import ReleasesAppState from 'App/State/ReleasesAppState';
 import Alert from 'Components/Alert';
+import SpinnerButton from 'Components/Link/SpinnerButton';
 import Icon from 'Components/Icon';
 import LoadingIndicator from 'Components/Loading/LoadingIndicator';
+import TextInput from 'Components/Form/TextInput';
 import FilterMenu from 'Components/Menu/FilterMenu';
 import PageMenuButton from 'Components/Menu/PageMenuButton';
 import Column from 'Components/Table/Column';
@@ -13,6 +15,7 @@ import TableBody from 'Components/Table/TableBody';
 import { align, icons, kinds, sortDirections } from 'Helpers/Props';
 import { SortDirection } from 'Helpers/Props/sortDirections';
 import {
+  clearReleases,
   fetchReleases,
   grabRelease,
   setEpisodeReleasesFilter,
@@ -124,6 +127,8 @@ function InteractiveSearch({ type, searchPayload }: InteractiveSearchProps) {
     isFetching,
     isPopulated,
     error,
+    searchWarning,
+    searchInfo,
     items,
     totalItems,
     selectedFilterKey,
@@ -136,6 +141,7 @@ function InteractiveSearch({ type, searchPayload }: InteractiveSearchProps) {
   );
 
   const dispatch = useDispatch();
+  const [customQuery, setCustomQuery] = useState('');
 
   const handleFilterSelect = useCallback(
     (selectedFilterKey: string | number) => {
@@ -161,6 +167,34 @@ function InteractiveSearch({ type, searchPayload }: InteractiveSearchProps) {
     [dispatch]
   );
 
+  const handleCustomQueryChange = useCallback(
+    ({ value }: { value: string }) => {
+      setCustomQuery(value);
+    },
+    []
+  );
+
+  const handleCustomSearch = useCallback(() => {
+    if (customQuery.trim()) {
+      dispatch(clearReleases());
+      dispatch(
+        fetchReleases({
+          ...searchPayload,
+          query: customQuery.trim(),
+        })
+      );
+    }
+  }, [customQuery, dispatch, searchPayload]);
+
+  const handleKeyDown = useCallback(
+    (event: React.KeyboardEvent<HTMLInputElement>) => {
+      if (event.key === 'Enter') {
+        handleCustomSearch();
+      }
+    },
+    [handleCustomSearch]
+  );
+
   useEffect(
     () => {
       // Only fetch releases if they are not already being fetched and not yet populated.
@@ -177,18 +211,46 @@ function InteractiveSearch({ type, searchPayload }: InteractiveSearchProps) {
 
   return (
     <div>
-      <div className={styles.filterMenuContainer}>
-        <FilterMenu
-          alignMenu={align.RIGHT}
-          selectedFilterKey={selectedFilterKey}
-          filters={filters}
-          customFilters={customFilters}
-          buttonComponent={PageMenuButton}
-          filterModalConnectorComponent={InteractiveSearchFilterModal}
-          filterModalConnectorComponentProps={{ type }}
-          onFilterSelect={handleFilterSelect}
-        />
+      <div className={styles.searchContainer}>
+        <div className={styles.customSearchContainer}>
+          <TextInput
+            className={styles.searchInput}
+            name="customQuery"
+            value={customQuery}
+            placeholder={translate('CustomSearchQuery')}
+            onChange={handleCustomQueryChange}
+            onKeyDown={handleKeyDown}
+          />
+          <SpinnerButton
+            kind={kinds.PRIMARY}
+            isSpinning={isFetching}
+            isDisabled={!customQuery.trim()}
+            onPress={handleCustomSearch}
+          >
+            {translate('Search')}
+          </SpinnerButton>
+        </div>
+        <div className={styles.filterMenuContainer}>
+          <FilterMenu
+            alignMenu={align.RIGHT}
+            selectedFilterKey={selectedFilterKey}
+            filters={filters}
+            customFilters={customFilters}
+            buttonComponent={PageMenuButton}
+            filterModalConnectorComponent={InteractiveSearchFilterModal}
+            filterModalConnectorComponentProps={{ type }}
+            onFilterSelect={handleFilterSelect}
+          />
+        </div>
       </div>
+
+      {searchWarning ? (
+        <Alert kind={kinds.WARNING}>{searchWarning}</Alert>
+      ) : null}
+
+      {searchInfo ? (
+        <Alert kind={kinds.INFO}>{searchInfo}</Alert>
+      ) : null}
 
       {isFetching ? <LoadingIndicator /> : null}
 

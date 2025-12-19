@@ -125,9 +125,14 @@ function InteractiveSearchRow(props: InteractiveSearchRowProps) {
 
   const onGrabPressWrapper = useCallback(() => {
     if (downloadAllowed) {
+      // Include searchPayload (which contains episodeId) so the backend knows
+      // which episode this grab is for. This is critical for Interactive Search
+      // to import to the correct episode instead of relying on parser guesses.
+      // Use props.searchPayload explicitly to avoid any shadowing issues.
       onGrabPress({
         guid,
         indexerId,
+        ...props.searchPayload,
       });
 
       return;
@@ -139,6 +144,7 @@ function InteractiveSearchRow(props: InteractiveSearchRowProps) {
     indexerId,
     downloadAllowed,
     onGrabPress,
+    props.searchPayload,
     setIsConfirmGrabModalOpen,
   ]);
 
@@ -310,6 +316,7 @@ function InteractiveSearchRow(props: InteractiveSearchRowProps) {
         protocol={protocol}
         isGrabbing={isGrabbing}
         grabError={grabError}
+        searchPayload={props.searchPayload}
         onModalClose={onOverrideModalClose}
       />
     </TableRow>

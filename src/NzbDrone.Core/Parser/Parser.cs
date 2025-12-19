@@ -33,6 +33,27 @@ namespace NzbDrone.Core.Parser
                 new Regex(@"^(?<airyear>19[6-9]\d|20\d\d)(?<sep>[-_]?)(?<airmonth>0\d|1[0-2])\k<sep>(?<airday>[0-2]\d|3[01])(?!\d)",
                           RegexOptions.IgnoreCase | RegexOptions.Compiled),
 
+                // Racing patterns - Formula 1, MotoGP/Moto2/Moto3, WSBK (Season = Year, Episode determined by GP name + session type matching)
+                // Matches: Formula1.2024.Monaco.Grand.Prix.Race, 06.F1.2025.R19.United.States.Grand.Prix.Sprint, MotoGP.2024.Round.05.France.Sprint
+                // Session types: Race, Q1/Q2, Qualifying/Quali, Sprint, Sprint Qualifying, FP1/FP2/FP3/FP4, Practice, Warm Up, Test, Superpole (WSBK), compound (FP4-Quali)
+                new Regex(@"^(?:\d+[\s._-]*)?(?<title>Formula\s?1?|F1|MotoGP|Moto2|Moto3|MotoE|WSBK)[.\s_-]+(?<season>\d{4})[.\s_-]+(?:R(?:ound)?[.\s_-]?\d{1,2}[.\s_-]+)?(?<gpname>(?:[A-Z][a-z]*(?:[.\s_-]+[A-Z][a-z]*)*?|[A-Z][a-z]*))[.\s_-]+(?<session>Race[.\s_-]?[12]?|(?:(?:Qualifying|Quali)[.\s_-]?)?Q[12]|QF|(?:Qualifying|Quali)[.\s_-]?(?:One|Two)|Qualifying|Quali|Superpole[.\s_-]?(?:Race)?|Sprint(?:[.\s_-]?(?:Qualifying|Quali|Shootout|Race))?|FP[.\s_-]?[1-4](?:[.\s_-]?(?:Qualifying|Quali))?|Practice[.\s_-]?\d?|Warm[.\s_-]?Up|Test(?:[.\s_-]?(?:Afternoon|Morning|Day[.\s_-]?\d+))?[.\s_-]?(?:Session)?)(?:[.\s_-]|\[|$)",
+                    RegexOptions.IgnoreCase | RegexOptions.Compiled),
+
+                // Racing patterns with YEARxEPISODE format: MotoGP.2025x19.Australia.Qualifying
+                // Format: Title.YEARxEPISODE.GPname.Session (episode number is ignored, GP name + session used for matching)
+                new Regex(@"^(?:\d+[\s._-]*)?(?<title>Formula\s?1?|F1|MotoGP|Moto2|Moto3|MotoE|WSBK)[.\s_-]+(?<season>\d{4})x\d+[.\s_-]+(?<gpname>(?:[A-Z][a-z]*(?:[.\s_-]+[A-Z][a-z]*)*?|[A-Z][a-z]*))[.\s_-]+(?<session>Race[.\s_-]?[12]?|(?:(?:Qualifying|Quali)[.\s_-]?)?Q[12]|QF|(?:Qualifying|Quali)[.\s_-]?(?:One|Two)|Qualifying|Quali|Superpole[.\s_-]?(?:Race)?|Sprint(?:[.\s_-]?(?:Qualifying|Quali|Shootout|Race))?|FP[.\s_-]?[1-4](?:[.\s_-]?(?:Qualifying|Quali))?|Practice[.\s_-]?\d?|Warm[.\s_-]?Up|Test(?:[.\s_-]?(?:Afternoon|Morning|Day[.\s_-]?\d+))?[.\s_-]?(?:Session)?)(?:[.\s_-]|\[|$)",
+                    RegexOptions.IgnoreCase | RegexOptions.Compiled),
+
+                // Racing patterns without year - space-separated names: "Austria MotoGP Race", "Moto2 Barcelona FP2", "COTA MotoGP Q1-Q2"
+                // Format: [GPname] Title [GPname] Session (year will be inferred from series folder/context)
+                new Regex(@"^(?:\d+[\s._-]*)?(?<gpname>[A-Za-z][A-Za-z\s]*?)?[.\s_-]*(?<title>MotoGP|Moto2|Moto3|MotoE|WSBK|F1|Formula\s?1?)[.\s_-]+(?<gpname2>[A-Za-z][A-Za-z\s]*?)?[.\s_-]*(?<session>Race[.\s_-]?[12]?|Q[12](?:-Q[12])?|QF|Qualifying|Quali|Superpole[.\s_-]?(?:Race)?|Sprint(?:[.\s_-]?(?:Qualifying|Quali|Shootout|Race))?|FP[.\s_-]?[1-4](?:[.\s_-]?(?:Qualifying|Quali))?|Practice[.\s_-]?\d?|Warm[.\s_-]?Up|Test(?:[.\s_-]?(?:Afternoon|Morning|Day[.\s_-]?\d+))?[.\s_-]?(?:Session)?)(?:[.\s_-]|\[|$)",
+                    RegexOptions.IgnoreCase | RegexOptions.Compiled),
+
+                // Racing patterns without session type - defaults to Race: "motogp.2015.aragon.720p", "formula1.2024.monaco.grand.prix.1080p"
+                // Format: Title.Year.[Round].GPName followed by quality marker - session will be empty and default to "Race"
+                new Regex(@"^(?:\d+[\s._-]*)?(?<title>Formula\s?1?|F1|MotoGP|Moto2|Moto3|MotoE|WSBK)[.\s_-]+(?<season>\d{4})[.\s_-]+(?:R(?:ound)?[.\s_-]?\d{1,2}[.\s_-]+)?(?<gpname>(?:[A-Z][a-z]*(?:[.\s_-]+[A-Z][a-z]*)*?|[A-Z][a-z]*))(?<session>)(?=[.\s_-]+(?:\d{3,4}p|HDTV|WEB|BluRay|BDRip|DVDRip|REPACK|PROPER|x264|x265|h\.?264|h\.?265|HEVC|AAC|DTS|AC3|720p?|1080p?|2160p?|4K|TNT|Sky|ESPN|DAZN|F1TV|BT|Fancode|Qualifying\+Race|QF)|\[|$)",
+                    RegexOptions.IgnoreCase | RegexOptions.Compiled),
+
                 // Multi-Part episodes without a title (S01E05.S01E06)
                 new Regex(@"^(?:\W*S(?<season>(?<!\d+)(?:\d{1,2}|\d{4})(?!\d+))(?:e{1,2}(?<episode>\d{1,3}(?!\d+)))+){2,}",
                           RegexOptions.IgnoreCase | RegexOptions.Compiled),
@@ -567,6 +588,39 @@ namespace NzbDrone.Core.Parser
             var fileInfo = new FileInfo(path);
             var result = ParseTitle(fileInfo.Name);
 
+            // For racing content, handle directory name parsing in two cases:
+            // 1. Filename parsed as racing content but is missing GP name
+            // 2. Filename didn't parse as racing content, but directory might contain racing info
+            if (fileInfo.Directory?.Name != null)
+            {
+                if (result != null && result.IsRacingContent && string.IsNullOrWhiteSpace(result.RacingGpName))
+                {
+                    // Case 1: Racing filename missing GP name - try to get it from directory
+                    Logger.Info("PARSEPATH: Racing content missing GP name in '{0}', attempting directory: {1}", fileInfo.Name, fileInfo.Directory.Name);
+                    var directoryResult = ParseTitle(fileInfo.Directory.Name);
+
+                    if (directoryResult != null && directoryResult.IsRacingContent && !string.IsNullOrWhiteSpace(directoryResult.RacingGpName))
+                    {
+                        // Merge GP name from directory into filename result
+                        result.RacingGpName = directoryResult.RacingGpName;
+                        Logger.Info("PARSEPATH: Merged GP name '{0}' from directory into result", directoryResult.RacingGpName);
+                    }
+                }
+                else if (result == null)
+                {
+                    // Case 2: Filename didn't parse - try directory for racing content
+                    Logger.Info("PARSEPATH: Filename '{0}' did not parse, trying directory: {1}", fileInfo.Name, fileInfo.Directory.Name);
+                    var directoryResult = ParseTitle(fileInfo.Directory.Name);
+
+                    if (directoryResult != null && directoryResult.IsRacingContent)
+                    {
+                        // Use the directory parse result as the base
+                        result = directoryResult;
+                        Logger.Info("PARSEPATH: Using directory result - GP={0}, Session={1}", directoryResult.RacingGpName, directoryResult.RacingSessionType);
+                    }
+                }
+            }
+
             // Parse using the folder and file separately, but combine if they both parse correctly.
             var episodeNumberMatch = SimpleEpisodeNumberRegex.Match(fileInfo.Name);
 
@@ -919,6 +973,113 @@ namespace NzbDrone.Core.Parser
         {
             var seriesName = matchCollection[0].Groups["title"].Value.Replace('.', ' ').Replace('_', ' ');
             seriesName = RequestInfoRegex.Replace(seriesName, "").Trim(' ');
+
+            // Check if this is racing content (Formula 1, MotoGP, WSBK)
+            // Note: gpname might be empty for patterns like "Austria MotoGP Race" where gpname is before title
+            if ((matchCollection[0].Groups["gpname"].Success || matchCollection[0].Groups["gpname2"].Success) && matchCollection[0].Groups["session"].Success)
+            {
+                // Combine gpname and gpname2 (one or both may be present depending on pattern)
+                var rawGpName = matchCollection[0].Groups["gpname"].Value;
+                if (string.IsNullOrWhiteSpace(rawGpName) && matchCollection[0].Groups["gpname2"].Success)
+                {
+                    rawGpName = matchCollection[0].Groups["gpname2"].Value;
+                }
+                else if (!string.IsNullOrWhiteSpace(rawGpName) && matchCollection[0].Groups["gpname2"].Success && !string.IsNullOrWhiteSpace(matchCollection[0].Groups["gpname2"].Value))
+                {
+                    // Both present - use gpname2 as it's after the title (closer to session)
+                    rawGpName = matchCollection[0].Groups["gpname2"].Value;
+                }
+
+                var sessionType = matchCollection[0].Groups["session"].Value;
+
+                // Season may be absent for space-separated patterns (will be inferred from folder/context later)
+                var seasonNumber = 0;
+                if (matchCollection[0].Groups["season"].Success && !string.IsNullOrEmpty(matchCollection[0].Groups["season"].Value))
+                {
+                    seasonNumber = int.Parse(matchCollection[0].Groups["season"].Value);
+                }
+
+                var sessionGroup = matchCollection[0].Groups["session"];
+
+                // Normalize racing series names: "Formula1" -> "Formula 1", but keep "F1", "MotoGP", "WSBK" as-is
+                var normalizedSeriesName = seriesName;
+                var seriesNameNoSpaces = seriesName.Replace(" ", "");
+
+                // Track the racing class for MotoGP variants (Moto2, Moto3, MotoE are episodes within MotoGP series)
+                string racingClass = null;
+
+                if (seriesNameNoSpaces.Equals("Formula1", StringComparison.OrdinalIgnoreCase))
+                {
+                    normalizedSeriesName = "Formula 1";
+                }
+                else if (seriesNameNoSpaces.Equals("F1", StringComparison.OrdinalIgnoreCase))
+                {
+                    normalizedSeriesName = "F1";
+                }
+                else if (seriesNameNoSpaces.Equals("MotoGP", StringComparison.OrdinalIgnoreCase))
+                {
+                    normalizedSeriesName = "MotoGP";
+                    racingClass = "motogp";
+                }
+                else if (seriesNameNoSpaces.Equals("Moto2", StringComparison.OrdinalIgnoreCase))
+                {
+                    normalizedSeriesName = "MotoGP";
+                    racingClass = "moto2";
+                }
+                else if (seriesNameNoSpaces.Equals("Moto3", StringComparison.OrdinalIgnoreCase))
+                {
+                    normalizedSeriesName = "MotoGP";
+                    racingClass = "moto3";
+                }
+                else if (seriesNameNoSpaces.Equals("MotoE", StringComparison.OrdinalIgnoreCase))
+                {
+                    normalizedSeriesName = "MotoGP";
+                    racingClass = "motoe";
+                }
+                else if (seriesNameNoSpaces.Equals("WSBK", StringComparison.OrdinalIgnoreCase))
+                {
+                    normalizedSeriesName = "WSBK";
+                }
+
+                var racingResult = new ParsedEpisodeInfo
+                {
+                    ReleaseTitle = releaseTitle,
+                    SeriesTitle = normalizedSeriesName,
+                    SeasonNumber = seasonNumber,
+                    EpisodeNumbers = Array.Empty<int>(),
+                    AbsoluteEpisodeNumbers = Array.Empty<int>(),
+                    IsRacingContent = true,
+                    RacingGpName = System.Globalization.CultureInfo.CurrentCulture.TextInfo.ToTitleCase(CleanRacingGpName(rawGpName).ToLower()),
+                    RacingSessionType = System.Globalization.CultureInfo.CurrentCulture.TextInfo.ToTitleCase(CleanRacingSessionType(sessionType).ToLower()),
+                    RacingClass = racingClass
+                };
+
+                racingResult.SeriesTitleInfo = GetSeriesTitleInfo(racingResult.SeriesTitle, matchCollection);
+
+                // Extract release tokens (quality, language, etc) from the remainder of the title
+                var lastIndex = sessionGroup.Index + sessionGroup.Length;
+                if (lastIndex < releaseTitle.Length)
+                {
+                    racingResult.ReleaseTokens = releaseTitle.Substring(lastIndex);
+                }
+                else
+                {
+                    racingResult.ReleaseTokens = "";
+                }
+
+                racingResult.Languages = LanguageParser.ParseLanguages(racingResult.ReleaseTokens);
+                Logger.Debug("Languages parsed: {0}", string.Join(", ", racingResult.Languages));
+
+                racingResult.Quality = QualityParser.ParseQuality(releaseTitle);
+                Logger.Debug("Quality parsed: {0}", racingResult.Quality);
+
+                racingResult.ReleaseGroup = ReleaseGroupParser.ParseReleaseGroup(releaseTitle);
+                Logger.Debug("Release Group parsed: {0}", racingResult.ReleaseGroup);
+
+                Logger.Info("PARSER: Racing content detected in '{0}' - GP: {1}, Session: {2}, Season: {3}", releaseTitle, racingResult.RacingGpName, racingResult.RacingSessionType, racingResult.SeasonNumber);
+
+                return racingResult;
+            }
 
             int.TryParse(matchCollection[0].Groups["airyear"].Value, out var airYear);
 
@@ -1282,6 +1443,39 @@ namespace NzbDrone.Core.Parser
             }
 
             return result.ToString();
+        }
+
+        private static string CleanRacingGpName(string rawGpName)
+        {
+            if (string.IsNullOrWhiteSpace(rawGpName))
+            {
+                return rawGpName;
+            }
+
+            return rawGpName
+                .Replace(".", " ")
+                .Replace("_", " ")
+                .Replace("-", " ")
+                .Replace("Grand Prix", "", StringComparison.OrdinalIgnoreCase)
+                .Replace("GP", "", StringComparison.OrdinalIgnoreCase)
+                .Trim()
+                .Replace("  ", " "); // Remove double spaces
+        }
+
+        private static string CleanRacingSessionType(string rawSession)
+        {
+            if (string.IsNullOrWhiteSpace(rawSession))
+            {
+                // Default to "Race" when no session type is specified
+                return "Race";
+            }
+
+            return rawSession
+                .Replace(".", " ")
+                .Replace("_", " ")
+                .Replace("-", " ")
+                .Trim()
+                .Replace("  ", " "); // Remove double spaces
         }
     }
 }
