@@ -323,8 +323,13 @@ export const actionHandlers = handleThunks({
     });
 
     request.done((data, textStatus, xhr) => {
-      const searchWarning = xhr.getResponseHeader('X-Search-Warning');
-      const searchInfo = xhr.getResponseHeader('X-Search-Info');
+      // Server percent-encodes these so non-ASCII titles survive as header values
+      const decodeHeader = (name) => {
+        const value = xhr.getResponseHeader(name);
+        return value ? decodeURIComponent(value) : null;
+      };
+      const searchWarning = decodeHeader('X-Search-Warning');
+      const searchInfo = decodeHeader('X-Search-Info');
 
       dispatch({
         type: `${section}/fetchSuccess`,

@@ -235,7 +235,7 @@ namespace Sonarr.Api.V3.Indexers
                 if (!string.IsNullOrWhiteSpace(searchWarning))
                 {
                     _logger.Info("API: Adding X-Search-Warning header: {0}", searchWarning);
-                    Response.Headers.Add("X-Search-Warning", searchWarning);
+                    Response.Headers.Add("X-Search-Warning", EncodeHeaderValue(searchWarning));
                 }
 
                 // Check if there's search info (e.g., successful query terms)
@@ -244,7 +244,7 @@ namespace Sonarr.Api.V3.Indexers
                 if (!string.IsNullOrWhiteSpace(searchInfo))
                 {
                     _logger.Info("API: Adding X-Search-Info header: {0}", searchInfo);
-                    Response.Headers.Add("X-Search-Info", searchInfo);
+                    Response.Headers.Add("X-Search-Info", EncodeHeaderValue(searchInfo));
                 }
 
                 return MapDecisions(prioritizedDecisions);
@@ -289,7 +289,7 @@ namespace Sonarr.Api.V3.Indexers
                 if (!string.IsNullOrWhiteSpace(searchInfo))
                 {
                     _logger.Info("API: Adding X-Search-Info header: {0}", searchInfo);
-                    Response.Headers.Add("X-Search-Info", searchInfo);
+                    Response.Headers.Add("X-Search-Info", EncodeHeaderValue(searchInfo));
                 }
 
                 return MapDecisions(prioritizedDecisions);
@@ -303,6 +303,12 @@ namespace Sonarr.Api.V3.Indexers
                 _logger.Error(ex, "Season search failed: " + ex.Message);
                 throw new NzbDroneClientException(HttpStatusCode.InternalServerError, ex.Message);
             }
+        }
+
+        // Header values must be ASCII; search info can include non-ASCII aliases (e.g. "Milliárdok nyomában")
+        private static string EncodeHeaderValue(string value)
+        {
+            return Uri.EscapeDataString(value);
         }
 
         private async Task<List<ReleaseResource>> GetRss()
